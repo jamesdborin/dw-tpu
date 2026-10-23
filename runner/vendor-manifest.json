@@ -1,0 +1,94 @@
+{
+  "vendor/smoke.py": {
+    "source": "dsv4-tpu/bench-a1/smoke.py",
+    "sha256": "74a5f6717a2322f1f80518b4c0f74737a625d37dd2c51ce4afaf8cf73a4d08e2"
+  },
+  "vendor/checkpoint.py": {
+    "source": "dsv4-tpu/bench-a1/checkpoint.py",
+    "sha256": "f79752ce3f83ae801ccb2c05400b975e9fe8fef4b0f7c3e8954118857b7e572c"
+  },
+  "vendor/checkpoint-manifest.json": {
+    "source": "dsv4-tpu/bench-a1/checkpoint-manifest.json",
+    "sha256": "88857151d914f29d19fa89be8294ff0ed6bce86f121ef0d6c23f5f682e07a873"
+  },
+  "vendor/probe.py": {
+    "source": "dsv4-tpu/bench-a1/probe.py",
+    "sha256": "89f7295c1e982e00d09a9b3b4f8424ad0c14c343fffab241729b018e704d563b"
+  },
+  "vendor/prompts.json": {
+    "source": "dsv4-tpu/bench-a1/prompts.json",
+    "sha256": "4f46e7910fd963ec9731f37c561cee5637ab445d18d9faea5ea7bf6ad42fe3a8"
+  },
+  "vendor/full-gpu-reference.json": {
+    "source": "dsv4-tpu/bench-a1/full-gpu-reference.json",
+    "sha256": "e079685a2b7cf8815021607433859944612605cad45734421db518aa15840dc7"
+  },
+  "vendor/allocation_events.py": {
+    "source": "dsv4-tpu/bench-a1/perf/allocation_events.py",
+    "sha256": "76d4f8aac4ba8e5e73362c77365c84660c47af2931ea5c721815c318fd86839a"
+  },
+  "vendor/reference_acceptance.py": {
+    "source": "dsv4-tpu/bench-a1/perf/reference_acceptance.py",
+    "sha256": "4d95cdc08d2791137aa6e440c6736c499a25a74c5f4b6b40f9f6c4351eb5f618"
+  },
+  "vendor/compare_prompt_reference.py": {
+    "source": "dsv4-tpu/bench-a1/perf/compare_prompt_reference.py",
+    "sha256": "1bf0daf3dfa8794bdf17ab213540dcd135be468e8bc52e8d4cd9103ba2e6559e"
+  },
+  "vendor/replay_capture.py": {
+    "source": "dsv4-tpu/prof-b2/replay_capture.py",
+    "sha256": "e821129b257e50756c74425856d37b711ae82404dc84e155402abfaf21ef1b7c"
+  },
+  "vendor/capture.py": {
+    "source": "dsv4-tpu/prof-b2/capture.py",
+    "sha256": "675a7ce0c59e76fa369358cfea2be043b5d8c22e205562869a67ff7e2c1433e2"
+  },
+  "vendor/profile-payloads.jsonl": {
+    "source": "dsv4-tpu/prof-b2/payloads/agents32-decode/payloads.jsonl",
+    "sha256": "767ab6383287e1fd7ad4d17c3c2212e2540c641fd0bd4bf19feac6aa6de17474"
+  },
+  "vendor/correctness.py": {
+    "source": "dsv4-tpu/bench-a1/perf/b0/correctness.py",
+    "sha256": "3011637141d94ebb991e920b86ad7502e873731748afe9d4c0ffbffd026fbae7"
+  },
+  "vendor/validate_bench.py": {
+    "source": "dsv4-tpu/bench-a1/perf/b0/validate_bench.py",
+    "sha256": "0780f1dea134f137bc13e450fe600570081a8ac402d50739af2b3e553d0872d7"
+  },
+  "vendor/cache_metrics.py": {
+    "source": "dsv4-tpu/bench-a1/perf/b0/cache_metrics.py",
+    "sha256": "e0d5d16ccbc512fda8eed0e14f71db96e948a7b4c690dc66f95af40798c409ea"
+  },
+  "vendor/run_measured.py": {
+    "source": "dsv4-tpu/bench-a1/perf/b0/run_measured.py",
+    "sha256": "70feabd74bc3ab33447bd8eb02da26d96f3ccc075f774b0e407516ff39000af4"
+  },
+  "vendor/validate_warmup.py": {
+    "source": "dsv4-tpu/bench-a1/perf/b0/validate_warmup.py",
+    "sha256": "659aec33a3af964119c69d6e66d8c1ac7f2d9b4acbf7f3cf722e4f25bd21aeeb"
+  },
+  "references/b0/correctness/greedy.json": {
+    "source": "dsv4-tpu/bench-a1/perf/evidence/b0/correctness/greedy.json",
+    "sha256": "deccdb8abac2490564b6f3f9728efe19d811abbfe144356f3c7c55c2ea47a565"
+  },
+  "references/b0/probes/full-http-probes.json": {
+    "source": "dsv4-tpu/bench-a1/perf/evidence/b0/probes/full-http-probes.json",
+    "sha256": "de00c4db33cbc06cf8e02cef7fc458590d5d5af8704f8577c5353f0226158d02"
+  },
+  "references/h17-model/correctness/greedy.json": {
+    "source": "dsv4-tpu/bench-a1/perf/evidence/h17-model/correctness/greedy.json",
+    "sha256": "497e2eae4e6762e8048af142b2a8ce6405751804aa52cab067ddf7e8f45e77c2"
+  },
+  "references/h17-model/probes/full-http-probes.json": {
+    "source": "dsv4-tpu/bench-a1/perf/evidence/h17-model/probes/full-http-probes.json",
+    "sha256": "c214eaca69b6b0b0bd95f02882e5df306b6f67f6e1e2db1f6d0a0d52babed99e"
+  },
+  "references/h4-r2/correctness/greedy.json": {
+    "source": "dsv4-tpu/bench-a1/perf/evidence/h4-r2/correctness/greedy.json",
+    "sha256": "fae924efb6123a41ea0ec4d0dba8758922cbbd2327e5cf7a3cdbd9f32489cc4d"
+  },
+  "references/h4-r2/probes/full-http-probes.json": {
+    "source": "dsv4-tpu/bench-a1/perf/evidence/h4-r2/probes/full-http-probes.json",
+    "sha256": "45cf910dc1e92f523102c00a93c2a51257796f360876c7c31c35d4b3fc9c38c2"
+  }
+}

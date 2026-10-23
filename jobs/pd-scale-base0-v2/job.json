@@ -1,0 +1,73 @@
+{
+  "id": "pd-scale-base0-v2",
+  "owner": "dsv4-runner",
+  "kind": "e2e",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "0",
+    "TPU_TOKEN_PADDINGS_PER_DP": "4,8,16,32,512",
+    "GPU_MEM": "0.68",
+    "MOE_PACKED_ROUTE_GATHER": "1",
+    "MOE_PACKED_ROUTE_GATHER_MAX_TOKENS": "512",
+    "MNBT": "512",
+    "MAX_SEQS": "32",
+    "MAX_LEN": "4096"
+  },
+  "serve_args_extra": [
+    "--enable-prompt-tokens-details"
+  ],
+  "acceptance": "reduction-order",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": false,
+  "est_minutes": 120,
+  "abort_if": [
+    "post-ready RESOURCE_EXHAUSTED",
+    "post-ready model/runner JIT compilation",
+    "launch-id mismatch",
+    "startup > 60 min"
+  ],
+  "success": "User request: push decode-only concurrency until ~20 tok/s/user and report the implied aggregate throughput.",
+  "fallback": null,
+  "bench_mode": "pd",
+  "pd": {
+    "prefill": {
+      "cases": [
+        {
+          "name": "cold3k",
+          "prompt_tokens": 3000,
+          "concurrency": [
+            32
+          ]
+        }
+      ],
+      "max_tokens": 1
+    },
+    "decode": {
+      "concurrency": [
+        128,
+        192,
+        256,
+        320,
+        384,
+        512
+      ],
+      "context_tokens": [
+        2500
+      ],
+      "context_source": [
+        "random"
+      ],
+      "measure_tokens": 128,
+      "warmup_tokens": 16,
+      "temperature": 1.0,
+      "capacity_check": "advisory"
+    }
+  },
+  "benchmark_on_gate_failure": true
+}

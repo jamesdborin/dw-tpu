@@ -1,0 +1,87 @@
+{
+  "id": "pd-final-prefill",
+  "owner": "dsv4-runner",
+  "kind": "e2e",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "0",
+    "TPU_TOKEN_PADDINGS_PER_DP": "4,8,16,512",
+    "GPU_MEM": "0.68",
+    "MOE_PACKED_ROUTE_GATHER": "1",
+    "MOE_PACKED_ROUTE_GATHER_MAX_TOKENS": "512",
+    "MNBT": "512",
+    "PD_CACHE_AFFINITY": "1"
+  },
+  "serve_args_extra": [
+    "--enable-prompt-tokens-details"
+  ],
+  "acceptance": "exact",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": false,
+  "est_minutes": 110,
+  "abort_if": [
+    "post-ready RESOURCE_EXHAUSTED",
+    "post-ready model/runner JIT compilation",
+    "launch-id mismatch",
+    "startup > 60 min",
+    "reduction-order gate failure"
+  ],
+  "success": "Original exact acceptance passes; two validated prefill repeats per case, verified prefix cache reuse, no preemptions; report capacity and TTFT without decode traffic.",
+  "fallback": null,
+  "bench_mode": "pd",
+  "pd": {
+    "prefill": {
+      "cases": [
+        {
+          "name": "cold5k",
+          "prompt_tokens": 5000,
+          "concurrency": [
+            32,
+            64,
+            128
+          ]
+        },
+        {
+          "name": "incr1650_on5k",
+          "cached_prefix_tokens": 5000,
+          "new_tokens": 1650,
+          "concurrency": [
+            32,
+            64,
+            128
+          ]
+        },
+        {
+          "name": "incr1650_on10k",
+          "cached_prefix_tokens": 10000,
+          "new_tokens": 1650,
+          "concurrency": [
+            32,
+            64,
+            128
+          ]
+        },
+        {
+          "name": "incr1650_on14k",
+          "cached_prefix_tokens": 14000,
+          "new_tokens": 1650,
+          "concurrency": [
+            32,
+            64,
+            128
+          ]
+        }
+      ],
+      "max_tokens": 1,
+      "repeats": 2,
+      "cache_affinity": true,
+      "verify_warm_cache": true
+    }
+  }
+}

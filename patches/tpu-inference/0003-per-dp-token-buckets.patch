@@ -1,0 +1,48 @@
+diff --git a/tpu_inference/runner/tpu_runner.py b/tpu_inference/runner/tpu_runner.py
+index c930fe1..b560462 100644
+--- a/tpu_inference/runner/tpu_runner.py
++++ b/tpu_inference/runner/tpu_runner.py
+@@ -1113,7 +1113,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+             max_token_size=scheduler_config.max_num_batched_tokens *
+             self.dp_size,
+             padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP,
+-            additional_sizes=additional_sizes)
++            additional_sizes=additional_sizes,
++            dp_size=self.dp_size)
+         self.num_tokens_paddings_per_dp = [
+             padding // self.dp_size for padding in self.num_tokens_paddings
+         ]
+diff --git a/tpu_inference/runner/utils.py b/tpu_inference/runner/utils.py
+index e76a5d3..0a4f880 100644
+--- a/tpu_inference/runner/utils.py
++++ b/tpu_inference/runner/utils.py
+@@ -230,7 +230,8 @@ def build_token_paddings(
+     min_token_size: int,
+     max_token_size: int,
+     padding_gap: int,
+-    additional_sizes: Sequence[int] = ()) -> list[int]:
++    additional_sizes: Sequence[int] = (),
++    *, dp_size: int = 1) -> list[int]:
+     """Token buckets for the runner: never pad a step past the budget.
+ 
+     `get_token_paddings` grows buckets until one covers `max_token_size`, so
+@@ -246,6 +247,19 @@ def build_token_paddings(
+     `compilation_sizes`, which are kept as given even when above the budget.
+     A budget that is already a bucket yields the stock list.
+     """
++    override = os.environ.get("TPU_TOKEN_PADDINGS_PER_DP")
++    if override is not None:
++        per_dp = [int(value.strip()) for value in override.split(",")]
++        assert dp_size > 0 and min_token_size > 0, "Invalid DP/alignment"
++        assert per_dp and all(value > 0 for value in per_dp), "Buckets must be positive"
++        assert per_dp == sorted(set(per_dp)), "Buckets must be strictly increasing"
++        paddings = [value * dp_size for value in per_dp]
++        assert paddings[-1] == max_token_size, "Last bucket must equal the scheduler budget"
++        assert all(value % min_token_size == 0 for value in paddings), "Buckets must respect token alignment"
++        logger.info(f"Prepared token paddings: {paddings}")
++        logger.info(f"Prepared token paddings per DP: {per_dp}")
++        return paddings
++
+     budget = -(-max_token_size // min_token_size) * min_token_size
+     generated = get_token_paddings(min_token_size, max_token_size, padding_gap)
+     sizes = {p for p in generated if p <= budget} | {budget}

@@ -1,0 +1,153 @@
+diff --git a/tokamax/_src/ops/experimental/gmm_v2/gmm_v2.py b/tokamax/_src/ops/experimental/gmm_v2/gmm_v2.py
+index 31822cf..ef179f7 100644
+--- a/tokamax/_src/ops/experimental/gmm_v2/gmm_v2.py
++++ b/tokamax/_src/ops/experimental/gmm_v2/gmm_v2.py
+@@ -126,6 +126,41 @@ def align_to(x, a):
+   return pl.cdiv(x, a) * a
+ 
+ 
++def needs_fp4_emulation(dtype: jnp.dtype) -> bool:
++  """Whether f4 rhs must be carried as uint4 and decoded in-kernel."""
++  return (
++      jnp.dtype(dtype) == jnp.dtype(jnp.float4_e2m1fn)
++      and pltpu.get_tpu_info().generation < 7
++  )
++
++
++def e2m1_to_codes(rhs: jax.Array) -> jax.Array:
++  """Re-encodes float4_e2m1fn values as the uint4 codes the kernel decodes.
++
++  A code holds, as a two's complement int4, q = sign * (2 * exponent +
++  mantissa) in [-7, 7] (i.e. the e2m1 magnitude bits with the sign applied;
++  -0 becomes +0). `decode_codes` turns it back into the exact e2m1 value with a
++  few bf16 VPU ops, ~4x cheaper than decoding the e2m1 bit fields.
++
++  This is an XLA elementwise pass over all of `rhs`: run it once on stored
++  weights (see gmm_v2's `rhs_fp4_codes`), not per call.
++  """
++  c = lax.bitcast_convert_type(rhs, jnp.uint4).astype(jnp.int8)
++  q = jnp.where(c >= 8, -(c & 7), c & 7).astype(jnp.int4)
++  return lax.bitcast_convert_type(q, jnp.uint4)
++
++
++def decode_codes(codes: jax.Array, dtype: jnp.dtype) -> jax.Array:
++  """Exactly decodes `e2m1_to_codes` codes to `dtype` (in-kernel)."""
++  # e2m1 magnitudes by code: 0 .5 1 1.5 2 3 4 6, i.e. q/2 with the slope
++  # doubling past |q| = 4 and again past |q| = 6:
++  #   v = 2q - clip(q, -4, 4) / 2 - clip(q, -6, 6).
++  # Every intermediate is a small multiple of 1/2, so bf16 is exact.
++  q = lax.bitcast_convert_type(codes, jnp.int4).astype(jnp.bfloat16)
++  v = (q + q) - (jnp.clip(q, -6, 6) + 0.5 * jnp.clip(q, -4, 4))
++  return v.astype(dtype)
++
++
+ def _get_lhs_sublane_size(dtype: jnp.dtype, size_m: int) -> int:
+   """Sublane block size the kernel processes lhs rows in."""
+   size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(dtype)
+@@ -278,6 +313,10 @@ class InputConfigs:
+   # unquantized (dtype != quant_dtype) the scale quantizes it online (lhs).
+   has_scale: bool = False
+   is_transposed: bool = False
++  # rhs holds float4_e2m1fn values as uint4 codes (see e2m1_to_codes). Set on
++  # TPUs whose Mosaic cannot materialize f4 vectors (v6e and older); the
++  # kernel decodes each tile to the lhs dtype in VMEM with VPU ops.
++  emulate_fp4: bool = False
+ 
+   @property
+   def should_unpack(self) -> bool:
+@@ -529,6 +568,8 @@ def inner_kernel(
+         :bucket_m
+     ]
+     tiled_rhs = tiled_rhs_ref.get_weight()
++    if cfgs.rhs_cfgs.emulate_fp4:
++      tiled_rhs = decode_codes(tiled_rhs, cfgs.lhs_cfgs.dtype)
+     if cfgs.transpose_rhs:
+       tiled_rhs = jnp.transpose(tiled_rhs)
+ 
+@@ -1409,8 +1450,13 @@ def make_gmm_configs(
+     transpose_rhs: bool = False,
+     lhs_quant_dtype: jnp.dtype | None = None,
+     rhs_quant_dtype: jnp.dtype | None = None,
++    emulate_rhs_fp4: bool = False,
+ ):
+-  """Fills the GMM config for the GMM kernel."""
++  """Fills the GMM config for the GMM kernel.
++
++  With emulate_rhs_fp4, `rhs` holds float4_e2m1fn values as uint4 codes (see
++  e2m1_to_codes) and is decoded to the lhs dtype inside the kernel.
++  """
+   packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
+ 
+   dims = validate_inputs(
+@@ -1446,10 +1492,17 @@ def make_gmm_configs(
+       is_transposed=transpose_rhs,
+   )
+ 
++  if emulate_rhs_fp4:
++    rhs_cfgs = dataclasses.replace(rhs_cfgs, emulate_fp4=True)
++
+   lhs_q_dtype = None
+   if maybe_quantize_lhs and rhs_cfgs.should_dequantize_after_matmul:
+     if lhs_quant_dtype is not None:
+       lhs_q_dtype = lhs_quant_dtype
++    elif emulate_rhs_fp4:
++      # Decoded rhs is in the lhs dtype already; chips needing emulation have
++      # no native fp8 MXU path, so quantizing lhs only costs accuracy.
++      lhs_q_dtype = None
+     else:
+       # Choose lhs quantization dtype based on TPU hardware support
+       # only if lhs_quant_dtype is not provided.
+@@ -1542,6 +1595,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
+         "zero_initialize",
+         "fuse_act",
+         "transpose_rhs",
++        "rhs_fp4_codes",
+     ]
+ )
+ def gmm_v2(
+@@ -1564,6 +1618,7 @@ def gmm_v2(
+     zero_initialize: bool = True,
+     fuse_act: str | None = None,
+     transpose_rhs: bool = False,
++    rhs_fp4_codes: bool = False,
+ ) -> jax.Array:
+   """GMM kernel implemented with emit_pipeline.
+ 
+@@ -1596,6 +1651,11 @@ def gmm_v2(
+     zero_initialize: Whether to initialize unvisited output elements to zero.
+     fuse_act: Activation function to fuse with GMM, None if no fusion.
+     transpose_rhs: Whether to transpose rhs in-core without HBM transposition.
++    rhs_fp4_codes: rhs is uint4 holding float4_e2m1fn values encoded by
++      `e2m1_to_codes`. Use this for stored weights on chips that need fp4
++      emulation (`needs_fp4_emulation`): a float4_e2m1fn rhs is re-encoded on
++      every call there, a full HBM pass over rhs (all groups, not only the
++      routed ones).
+ 
+   Returns:
+     Output of shape [size_m, size_n].
+@@ -1621,6 +1681,17 @@ def gmm_v2(
+   if vmem_limit_bytes is None:
+     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+ 
++  if rhs_fp4_codes:
++    if jnp.dtype(rhs.dtype) != jnp.dtype(jnp.uint4):
++      raise ValueError(f"rhs_fp4_codes expects uint4 rhs, got {rhs.dtype}.")
++    emulate_rhs_fp4 = True
++  else:
++    emulate_rhs_fp4 = needs_fp4_emulation(rhs.dtype)
++    if emulate_rhs_fp4:
++      rhs = e2m1_to_codes(rhs)
++  if emulate_rhs_fp4 and rhs_quant_dtype is not None:
++    rhs_quant_dtype = jnp.uint4.dtype
++
+   cfgs = make_gmm_configs(
+       lhs,
+       rhs,
+@@ -1639,6 +1710,7 @@ def gmm_v2(
+       transpose_rhs=transpose_rhs,
+       lhs_quant_dtype=lhs_quant_dtype,
+       rhs_quant_dtype=rhs_quant_dtype,
++      emulate_rhs_fp4=emulate_rhs_fp4,
+   )
+   dims = cfgs.dims
+   tiles = cfgs.tiles

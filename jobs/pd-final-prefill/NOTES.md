@@ -1,0 +1,5 @@
+Prefill-only derived from pd-base0. Packed gather unchanged; MNBT2048 equals top bucket16,512,2048; GPU_MEM0.68; MAX_LEN18432 permits15000+1650+1. Original exact acceptance and abort gates retained. Profile false.24 cohorts: cold5k and1650 new on5k/10k/15k atN32/64/128, each twice.
+
+Cache affinity is job-scoped (PD_CACHE_AFFINITY=1 plus per-request vllm_xargs.pd_cache_rank), maps i modulo32 identically for warm and timed passes, and leaves acceptance requests without the hint on original routing. This models a prefill pool with cache-aware placement; it changes routing, not numerics. An untimed cache-verification pass runs before timing and must pass for the case to be valid. Timed cache hits and preemption counters still determine validity; failures are never waived.
+
+Large-bucket compilation/HBM feasibility and actual cache retention remain hardware checks. No real-size CPU model tests. Capacity checking is conservative. Per-chip rates divide measured whole-slice rates by32; they are accounting normalization, not single-chip measurements.

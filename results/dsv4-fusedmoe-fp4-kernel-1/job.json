@@ -1,0 +1,19 @@
+{
+  "id": "dsv4-fusedmoe-fp4-kernel-1",
+  "owner": "dsv4-fusedmoe-fp4",
+  "kind": "kernel",
+  "base": "dw-tpu@1038ede853c094e4f96e4def6638135ed5bc44a5",
+  "depends_on": [],
+  "env": {},
+  "serve_args_extra": [],
+  "acceptance": "reduction-order",
+  "bench": null,
+  "profile": false,
+  "est_minutes": 22,
+  "abort_if": [
+    "non-v6e or local chip count != 4",
+    "bench still running after 25 min (timeout 1500 s)"
+  ],
+  "success": "result.json done=true; for every tpc in 4,8,16,32: fused_* (best config) us_per_layer present, numerics fused_finite and fused_repeat_bitwise true, fused_vs_ref.rms <= 1.10 x gmm_ep_vs_ref.rms and maxabs <= 2 x. Speed: fused best vs gmm_ep/gmm_tp us_per_layer reported (informational; the kernel streams all local experts' weights).",
+  "fallback": null
+}

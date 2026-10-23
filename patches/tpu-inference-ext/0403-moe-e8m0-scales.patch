@@ -1,0 +1,197 @@
+From 5bb0e2e2c26b67a9081ca99b7c6b1005b225a7ff Mon Sep 17 00:00:00 2001
+From: James Dborin <james.dborin@doubleword.ai>
+Date: Thu, 22 Oct 2026 13:06:26 +0100
+Subject: [PATCH] MoE: MOE_SCALE_E8M0 stores GMM expert block scales as uint8
+ exponents (exact)
+
+With MOE_SCALE_E8M0=1 (default off; supersedes MOE_SCALE_BF16, which
+becomes the fallback) the f32 fp4 block-32 requant scales are stored as
+their uint8 f32 biased-exponent codes (code 0 = +0.0 for zero-padded
+blocks) when that is lossless (positive normal powers of two or +0,
+checked per tensor at load), in XLA's default unpadded layout.
+gmm_wrapper rebuilds the exact f32 scales (shift + bitcast) before
+gmm_v2, so the kernel input is bit-identical. Saves ~3.0 GiB/chip at TP8
+vs f32 (1.0 GiB vs bf16) for one layer's f32 scale copy per gmm call.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MQhK9cavqLsEnxm6YHREB3
+---
+ tpu_inference/envs.py                         |  8 ++++
+ tpu_inference/layers/common/fused_moe_gmm.py  |  4 ++
+ .../common/process_weights/moe_weights.py     | 43 +++++++++++++------
+ .../layers/common/quantization/e8m0_scale.py  | 40 +++++++++++++++++
+ 4 files changed, 82 insertions(+), 13 deletions(-)
+ create mode 100644 tpu_inference/layers/common/quantization/e8m0_scale.py
+
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index 3aee20589..cac070a53 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -94,6 +94,7 @@ if TYPE_CHECKING:
+     MOE_TP_EXPERT_SPLIT: int = 1
+     MOE_SHARED_EXPERT_TP: bool = False
+     MOE_SCALE_BF16: bool = False
++    MOE_SCALE_E8M0: bool = False
+     DSV4_WO_A_FP8_STORE: bool = False
+     MOE_F32_REDUCE: bool = False
+     MOE_HIERARCHICAL_COLLECT: bool = False
+@@ -607,6 +608,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # transient per call). Bit-identical.
+     "DSV4_WO_A_FP8_STORE":
+     env_bool("DSV4_WO_A_FP8_STORE", default=False),
++    # Store requantized FP4 routed-expert block scales as uint8 exponent codes
++    # (GMM_TP / GMM_EP), decoded to the exact f32 scales at each gmm call.
++    # Supersedes MOE_SCALE_BF16 (used as fallback). Lossless check at load.
++    # Quarters persistent scale HBM (~3 GiB per chip for DeepSeek V4 Flash at
++    # TP8) for one layer's f32 scale copy per call. Bit-identical.
++    "MOE_SCALE_E8M0":
++    env_bool("MOE_SCALE_E8M0", default=False),
+     # GMM_TP + attention DP: combine each shard's routed partial in f32 and
+     # reduce-scatter f32 partials (one bf16 rounding of the MoE output instead
+     # of one per shard plus the collective's own). More accurate than the
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index ff7bd2f5c..fe5da16a6 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -33,6 +33,7 @@ from tpu_inference.kernels.sparse_core.ragged_gather_v2 import \
+     ragged_gather_v2 as ragged_gather
+ from tpu_inference.layers.common.linear import _safe_calculate_tiling
+ from tpu_inference.layers.common.quantization import quantize_tensor
++from tpu_inference.layers.common.quantization.e8m0_scale import e8m0_decode
+ from tpu_inference.layers.common.shared_expert_tp import \
+     tp_shared_expert_partial_local
+ from tpu_inference.layers.common.sharding import ShardingAxisName
+@@ -189,6 +190,9 @@ def gmm_wrapper(lhs,
+     if rhs_scale is not None and rhs_scale.dtype == jnp.bfloat16:
+         # MOE_SCALE_BF16 storage: widen exactly; the kernel sees f32 as before.
+         rhs_scale = rhs_scale.astype(jnp.float32)
++    elif rhs_scale is not None and rhs_scale.dtype == jnp.uint8:
++        # MOE_SCALE_E8M0 storage: exact f32 scales from the exponent codes.
++        rhs_scale = e8m0_decode(rhs_scale)
+     gmm_res = gmm_v2(
+         lhs=lhs,
+         rhs=rhs,
+diff --git a/tpu_inference/layers/common/process_weights/moe_weights.py b/tpu_inference/layers/common/process_weights/moe_weights.py
+index 0dd733dcd..bb5e0230b 100644
+--- a/tpu_inference/layers/common/process_weights/moe_weights.py
++++ b/tpu_inference/layers/common/process_weights/moe_weights.py
+@@ -25,6 +25,7 @@ import tpu_inference.envs as envs
+ from tpu_inference.layers.common.moe import MoEBackend
+ from tpu_inference.layers.common.quantization import (dequantize_tensor,
+                                                       quantize_tensor)
++from tpu_inference.layers.common.quantization.e8m0_scale import e8m0_encode
+ from tpu_inference.layers.common.sharding import ShardingAxisName
+ from tpu_inference.layers.common.utils import (
+     general_device_put, reorder_concatenated_tensor_for_sharding)
+@@ -639,24 +640,38 @@ def fp4_weight_to_codes(weight: jax.Array) -> jax.Array:
+ 
+ def maybe_bf16_moe_scales(weights: FusedMoEWeights,
+                           moe_backend: MoEBackend) -> FusedMoEWeights:
+-    """MOE_SCALE_BF16: store GMM expert block scales as bf16 when lossless.
+-
+-    The scales are only stored as bf16: gmm_wrapper widens them back to f32
+-    right before gmm_v2, so the kernel sees exactly the f32 values it sees
+-    today and results are bit-identical. Only scales that round-trip through
+-    bf16 unchanged are converted (checked per layer; fp4 block-32 requant
+-    scales are powers of two, so all of them do). shard_moe_weights keeps
+-    bf16 scales in XLA's default layout, which moves the unit dim major and
+-    stores them unpadded (a forced (0,1,2,3) layout tiles the unit dim to 2
+-    rows and saves nothing). Cost: one layer's f32 scale copy per gmm call.
++    """MOE_SCALE_E8M0 / MOE_SCALE_BF16: compact GMM expert block scale storage.
++
++    MOE_SCALE_E8M0 stores each scale as its uint8 f32-exponent code (see
++    quantization/e8m0_scale.py; supersedes bf16), MOE_SCALE_BF16 as bf16. The
++    scales are only stored compactly: gmm_wrapper rebuilds the f32 scales right
++    before gmm_v2, so the kernel sees exactly the f32 values it sees today and
++    results are bit-identical. A layer's scale is converted only if the
++    encoding is lossless (checked per tensor; fp4 block-32 requant scales are
++    positive powers of two, so all of them are); otherwise it falls back to
++    bf16 (if enabled and lossless) and then to f32. shard_moe_weights keeps
++    compact scales in XLA's default layout, which moves the unit dim major
++    and stores them unpadded (a forced (0,1,2,3) layout pads the unit dim to
++    the packing and saves nothing). Cost: one layer's f32 scale copy per gmm
++    call.
+     """
+-    if (not envs.MOE_SCALE_BF16
++    if ((not envs.MOE_SCALE_BF16 and not envs.MOE_SCALE_E8M0)
+             or moe_backend not in (MoEBackend.GMM_TP, MoEBackend.GMM_EP)):
+         return weights
+     for key in ("w13_weight_scale", "w2_weight_scale"):
+         scale = getattr(weights, key)
+         if scale is None or scale.dtype != jnp.float32:
+             continue
++        if envs.MOE_SCALE_E8M0:
++            codes, lossless = e8m0_encode(scale)
++            if bool(lossless):
++                setattr(weights, key, codes)
++                continue
++            logger.warning_once(
++                "MOE_SCALE_E8M0: %s has scales that are not positive powers "
++                "of two (or +0); not storing it as e8m0.", key)
++            if not envs.MOE_SCALE_BF16:
++                continue
+         scale_bf16 = scale.astype(jnp.bfloat16)
+         if not bool(jnp.all(scale_bf16.astype(jnp.float32) == scale)):
+             logger.warning_once(
+@@ -699,8 +714,10 @@ def shard_moe_weights(
+         key = field.name
+         if (weight := getattr(weights, key, None)) is not None:
+             layout = getattr(weight_layouts, key)
+-            if key.endswith("_scale") and weight.dtype == jnp.bfloat16:
+-                layout = None  # MOE_SCALE_BF16: default (unpadded) layout
++            if key.endswith("_scale") and weight.dtype in (jnp.bfloat16,
++                                                           jnp.uint8):
++                # MOE_SCALE_BF16/E8M0: default (unpadded) layout
++                layout = None
+             sharding = getattr(weight_shardings, key)
+             weight = general_device_put(weight, sharding, layout=layout)
+             if (key in ("w13_weight", "w2_weight") and moe_backend
+diff --git a/tpu_inference/layers/common/quantization/e8m0_scale.py b/tpu_inference/layers/common/quantization/e8m0_scale.py
+new file mode 100644
+index 000000000..9b2dca225
+--- /dev/null
++++ b/tpu_inference/layers/common/quantization/e8m0_scale.py
+@@ -0,0 +1,40 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""uint8 exponent storage for power-of-two f32 scales (MOE_SCALE_E8M0).
++
++A code is the f32 biased-exponent field: code c in 1..254 stands for the f32
++2**(c - 127) and code 0 for +0.0 (e.g. zero-padded blocks). Decoding is a
++shift and bitcast, so it reproduces the stored f32 bit pattern exactly for
++every scale ``encode`` accepts (positive normal powers of two, or +0.0).
++"""
++
++import jax
++import jax.numpy as jnp
++
++_NON_E8M0_BITS = 0x807FFFFF  # sign + mantissa bits must be clear
++
++
++def e8m0_encode(scale: jax.Array) -> tuple[jax.Array, jax.Array]:
++    """f32 scale -> (uint8 codes, lossless flag as a 0-d bool array)."""
++    bits = jax.lax.bitcast_convert_type(scale.astype(jnp.float32), jnp.uint32)
++    exp = bits >> 23
++    lossless = jnp.all(((bits & jnp.uint32(_NON_E8M0_BITS)) == 0)
++                       & (exp != 255))
++    return exp.astype(jnp.uint8), lossless
++
++
++def e8m0_decode(codes: jax.Array) -> jax.Array:
++    """uint8 codes -> the exact f32 scales they encode."""
++    return jax.lax.bitcast_convert_type(codes.astype(jnp.uint32) << 23,
++                                        jnp.float32)
+-- 
+2.34.1
+

@@ -1,0 +1,370 @@
+From a8cd0a81ac2e4a053e4ea48f4c00ce50ee3838d3 Mon Sep 17 00:00:00 2001
+From: dsv4-moe-overlap <w@x>
+Date: Tue, 20 Oct 2026 17:11:19 +0100
+Subject: [PATCH 103/108] MOE_TP_EXPERT_SPLIT: GMM_TP expert groups so each
+ shard's intermediate slice needs no 128-lane padding
+
+---
+ tpu_inference/envs.py                         |   7 +
+ tpu_inference/layers/common/fused_moe_gmm.py  |  32 +++-
+ .../process_weights/moe_expert_split.py       | 169 ++++++++++++++++++
+ .../layers/vllm/quantization/mxfp4.py         |  38 +++-
+ 4 files changed, 241 insertions(+), 5 deletions(-)
+ create mode 100644 tpu_inference/layers/common/process_weights/moe_expert_split.py
+
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index f1f274173..ffd39ec88 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -91,6 +91,7 @@ if TYPE_CHECKING:
+     MOE_ONESHOT_GATHER: bool = False
+     MOE_ONESHOT_SCATTER: bool = False
+     MOE_ONESHOT_MAX_TOKENS: int = 512
++    MOE_TP_EXPERT_SPLIT: int = 1
+     MOE_HIERARCHICAL_COLLECT: bool = False
+     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
+     RAGGED_GATHER_TRIM_ROWS: bool = True
+@@ -576,6 +577,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # kernels; larger (prefill) buckets keep XLA's collectives.
+     "MOE_ONESHOT_MAX_TOKENS":
+     lambda: int(os.getenv("MOE_ONESHOT_MAX_TOKENS") or "512"),
++    # GMM_TP: split the experts into this many groups, each tensor-sharded over
++    # MLP_TENSOR / split shards, so each shard's intermediate slice is wider
++    # (no 128-lane padding of a 64-wide slice). Changes the weight layout at
++    # load time and the partial-sum grouping (reduction order). 1 = off.
++    "MOE_TP_EXPERT_SPLIT":
++    lambda: int(os.getenv("MOE_TP_EXPERT_SPLIT") or "1"),
+     # The reverse for the EP collect: each chip's two cores add column halves
+     # on-chip, then reduce-scatter half the columns over the attention-data
+     # axes. Same mesh and hidden-size conditions as MOE_HIERARCHICAL_DISPATCH.
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index 85fea6cab..820b0ddbd 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -294,6 +294,22 @@ def _hierarchical_collect_plan(mesh: Mesh, hidden: int) -> tuple | None:
+     return pair_axis, perm
+ 
+ 
++def _tp_split_group_offset(local_experts: int,
++                           num_experts: int) -> jax.Array:
++    """First expert of this shard's group under MOE_TP_EXPERT_SPLIT: shard c of
++    the tp MLP_TENSOR shards holds group c // (tp / split)."""
++    axes = _as_axes(ShardingAxisName.MLP_TENSOR)
++    tp, rank = 1, 0
++    for a in axes:
++        size = jax.lax.axis_size(a)
++        rank = rank * size + jax.lax.axis_index(a)
++        tp *= size
++    split = num_experts // local_experts
++    assert tp % split == 0, (tp, split)
++    group = rank // (tp // split)
++    return jnp.reshape(group * local_experts, (1, )).astype(jnp.int32)
++
++
+ def moe_gmm_local(x: jax.Array,
+                   w1: jax.Array,
+                   w1_scale: jax.Array | None,
+@@ -323,6 +339,12 @@ def moe_gmm_local(x: jax.Array,
+ 
+     assert parallelism in ["tp", "ep"]
+ 
++    # MOE_TP_EXPERT_SPLIT: this TP shard holds w1.shape[0] of the experts
++    # (moe_expert_split.py); offset to its expert group.
++    tp_split = parallelism == "tp" and w1.shape[0] < group_sizes.size
++    if tp_split:
++        group_offset = _tp_split_group_offset(w1.shape[0], group_sizes.size)
++
+     # GMM1 computes x @ (W_up | W_gate) together and activation, output is [tokens,padded_intermediate_size]
+     gmm1_res = gmm_wrapper(
+         x,
+@@ -379,7 +401,7 @@ def moe_gmm_local(x: jax.Array,
+ 
+     # Chunk Size Resolution
+     num_tokens = batch_size // topk
+-    is_onehot = (local_group_size < group_sizes.size) and (
++    is_onehot = (not tp_split) and (local_group_size < group_sizes.size) and (
+         onehot_moe_permute_threshold > 0
+         and batch_size <= onehot_moe_permute_threshold)
+     if moe_chunk_size > 0 and num_tokens > moe_chunk_size * scatter_axis_size and not is_onehot:
+@@ -407,7 +429,7 @@ def moe_gmm_local(x: jax.Array,
+             group_offset,
+             group_offset + local_group_size,
+         )
+-        if is_onehot:
++        if is_onehot or tp_split:
+             # gmm_v2 runs with zero_initialize=False, leaving rows outside this
+             # EP shard's [token_start, token_end) range uninitialized in HBM.
+             # Zero them out before `combine @ gmm2_res` so IEEE-754 `0.0 * NaN`
+@@ -429,7 +451,7 @@ def moe_gmm_local(x: jax.Array,
+         cur_weights = topk_weights[start_tok:end_tok]
+         cur_mask = mask[start_tok:end_tok]
+ 
+-        if local_group_size < group_sizes.size:
++        if local_group_size < group_sizes.size and not tp_split:
+             if onehot_moe_permute_threshold > 0 and batch_size <= onehot_moe_permute_threshold:
+                 revert_indices = cur_indices.reshape(-1, topk)
+                 onehot = jax.nn.one_hot(revert_indices,
+@@ -958,7 +980,9 @@ def fused_moe_func(
+                                  fp8_post_gather=all_gather_fp8)
+ 
+     num_tokens, hidden_size = hidden_states.shape
+-    global_num_experts, padded_hidden_size, _ = w1.shape
++    _, padded_hidden_size, _ = w1.shape
++    # Not w1.shape[0]: with MOE_TP_EXPERT_SPLIT each shard's w1 holds a group.
++    global_num_experts = gating_output.shape[-1]
+     dtype = hidden_states.dtype
+ 
+     assert (num_tokens * topk) % 16 == 0, (
+diff --git a/tpu_inference/layers/common/process_weights/moe_expert_split.py b/tpu_inference/layers/common/process_weights/moe_expert_split.py
+new file mode 100644
+index 000000000..795400d30
+--- /dev/null
++++ b/tpu_inference/layers/common/process_weights/moe_expert_split.py
+@@ -0,0 +1,169 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Expert split for GMM_TP (MOE_TP_EXPERT_SPLIT).
++
++GMM_TP gives every one of the ``tp`` shards a 1/tp slice of every expert's
++intermediate dimension. When that slice is narrower than 128 lanes (DeepSeek
++V4 Flash on 32 chips: 2048 / 32 = 64), the fused gate/up GMM needs each half
++padded to 128 lanes, so half the w13 bytes every shard streams are zeros and
++the w2 GMM contracts a 64-deep K with a 128-deep tile.
++
++With split S, the experts are divided into S groups of E/S and each group is
++tensor-sharded over tp/S shards: shard c holds experts
++[(c // (tp/S)) * E/S, +E/S) and intermediate columns
++[(c % (tp/S)) * I*S/tp, +I*S/tp) of each of them. The weights keep the GMM_TP
++shapes and shardings (experts unsharded, intermediate on MLP_TENSOR), with E/S
++instead of E experts. Every shard still sees every token after the dispatch
++all-gather, runs its local experts only (group_offset), and the output
++reduce-scatter adds the partial sums exactly as before. Only the grouping of
++the partial sums changes (reduction order).
++"""
++
++import jax
++import jax.numpy as jnp
++
++
++def split_local_intermediate(intermediate_size: int, tp: int, split: int) -> int:
++    return intermediate_size * split // tp
++
++
++def split_supported(num_experts: int, intermediate_size: int, tp: int,
++                    split: int, align: int = 128) -> bool:
++    return (split > 1 and tp % split == 0 and num_experts % split == 0
++            and (intermediate_size * split) % tp == 0
++            and split_local_intermediate(intermediate_size, tp, split) %
++            align == 0)
++
++
++def _split_w13_cols(t, *, tp, split, local, padded_local):
++    """[E, ..., tp * 2 * padded_local] GMM_TP w13 columns -> [E/S, ..., tp * 2 * L'].
++
++    Input shard c holds [w1 cols c*local.. (+pad) | w3 cols c*local.. (+pad)].
++    """
++    e = t.shape[0]
++    mid = t.shape[1:-1]
++    t = t.reshape(e, *mid, tp, 2, padded_local)[..., :local]  # drop padding
++    # -> [E, ..., 2, I] with I = tp * local in original column order
++    nd = t.ndim
++    t = jnp.moveaxis(t, nd - 3, nd - 2)  # [E, ..., 2, tp, local]
++    t = t.reshape(e, *mid, 2, tp * local)
++    lp = split_local_intermediate(tp * local, tp, split)
++    g = tp // split
++    # [S, E', ..., 2, g, L']
++    t = t.reshape(split, e // split, *mid, 2, g, lp)
++    # target shard c = h * g + s holds [w1 | w3] of expert group h, slice s:
++    # [E', ..., S, g, 2, L']
++    nd = t.ndim
++    perm = (list(range(1, nd - 3)) + [0, nd - 2, nd - 3, nd - 1])
++    t = jnp.transpose(t, perm)
++    return t.reshape(e // split, *mid, tp * 2 * lp)
++
++
++def _split_w2_rows(t, *, tp, split, rows_per_unit):
++    """[E, I_units, ..., H] -> [E/S, I_units, ..., H] with shard c's rows from
++    expert group c // (tp/S), intermediate slice c % (tp/S). ``rows_per_unit``
++    is how many intermediate columns one row of dim 1 covers (1 for weights,
++    the block size for block scales)."""
++    e, units = t.shape[0], t.shape[1]
++    rest = t.shape[2:]
++    g = tp // split
++    per = units // g  # rows of dim 1 per target shard
++    t = t.reshape(split, e // split, g, per, *rest)
++    t = jnp.moveaxis(t, 0, 1)  # [E', S, g, per, ...]
++    return t.reshape(e // split, split * g * per, *rest)
++
++
++def _to_bytes(t):
++    """4-bit arrays -> uint8 [..., n/2] (pairs along the last dim), else as is.
++
++    Moving packed bytes instead of 4-bit elements makes the relayout an
++    ordinary byte copy (XLA CPU handles sub-byte transposes element by element,
++    ~20 s per DeepSeek V4 layer). Every moved run starts at an even element.
++    """
++    if t.dtype not in (jnp.float4_e2m1fn, jnp.uint4, jnp.int4):
++        return t, None
++    return jax.lax.bitcast_convert_type(
++        t.reshape(*t.shape[:-1], t.shape[-1] // 2, 2), jnp.uint8), t.dtype
++
++
++def _from_bytes(t, dtype):
++    if dtype is None:
++        return t
++    return jax.lax.bitcast_convert_type(t, dtype).reshape(*t.shape[:-1],
++                                                           t.shape[-1] * 2)
++
++
++def split_gmm_tp_weights(w13_weight,
++                         w13_weight_scale,
++                         w2_weight,
++                         w2_weight_scale,
++                         *,
++                         tp: int,
++                         split: int,
++                         align: int = 128):
++    """Re-lay GMM_TP-processed MoE weights for MOE_TP_EXPERT_SPLIT=split.
++
++    Shapes in (GMM_TP layout after process_moe_weights):
++      w13_weight       [E, H, tp * 2 * Lp]      (Lp = padded local intermediate)
++      w13_weight_scale [E, H/bk, 1, tp * 2 * Lp]
++      w2_weight        [E, I, H]
++      w2_weight_scale  [E, I/bk2, 1, H]
++    Shapes out: E -> E/S, w13 last dim tp * 2 * L' (= 2 * S * I), w2 dim 1 S * I
++    (= tp * L'); the total number of kept values is unchanged.
++    Pure data movement: every kept value is copied bit for bit.
++    """
++    e = w13_weight.shape[0]
++    intermediate = w2_weight.shape[1]
++    assert split_supported(e, intermediate, tp, split,
++                           align), (e, intermediate, tp, split)
++    local = intermediate // tp
++    padded_local = w13_weight.shape[-1] // (2 * tp)
++    assert padded_local >= local, (padded_local, local)
++    w13_bytes, w13_dtype = _to_bytes(w13_weight)
++    pack = 1 if w13_dtype is None else 2
++    assert local % pack == 0 and padded_local % pack == 0
++    w13 = _from_bytes(
++        _split_w13_cols(w13_bytes,
++                        tp=tp,
++                        split=split,
++                        local=local // pack,
++                        padded_local=padded_local // pack), w13_dtype)
++    w13s = None
++    if w13_weight_scale is not None:
++        assert w13_weight_scale.shape[-1] == w13_weight.shape[-1]
++        w13s = _split_w13_cols(w13_weight_scale,
++                               tp=tp,
++                               split=split,
++                               local=local,
++                               padded_local=padded_local)
++    w2_bytes, w2_dtype = _to_bytes(w2_weight)
++    w2 = _from_bytes(
++        _split_w2_rows(w2_bytes, tp=tp, split=split, rows_per_unit=1),
++        w2_dtype)
++    w2s = None
++    if w2_weight_scale is not None:
++        units = w2_weight_scale.shape[1]
++        assert intermediate % units == 0
++        bk2 = intermediate // units
++        assert split_local_intermediate(intermediate, tp, split) % bk2 == 0
++        w2s = _split_w2_rows(w2_weight_scale,
++                             tp=tp,
++                             split=split,
++                             rows_per_unit=bk2)
++    return w13, w13s, w2, w2s
++
++
++split_gmm_tp_weights_jit = jax.jit(split_gmm_tp_weights,
++                                   static_argnames=("tp", "split", "align"),
++                                   donate_argnums=(0, 1, 2, 3))
+diff --git a/tpu_inference/layers/vllm/quantization/mxfp4.py b/tpu_inference/layers/vllm/quantization/mxfp4.py
+index a681df95a..e356ed078 100644
+--- a/tpu_inference/layers/vllm/quantization/mxfp4.py
++++ b/tpu_inference/layers/vllm/quantization/mxfp4.py
+@@ -41,9 +41,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
+ from tpu_inference import envs
+ from tpu_inference.layers.common.moe import \
+     FusedMoEMethodBase as TpuFusedMoEMethodBase
++from tpu_inference.layers.common.moe import MoEBackend
+ from tpu_inference.layers.common.process_weights.moe_weights import (
+     FusedMoEWeights, process_moe_weights, quantize_moe_weights,
+     shard_moe_weights)
++from tpu_inference.layers.common.process_weights.moe_expert_split import (
++    split_gmm_tp_weights_jit, split_supported)
+ from tpu_inference.layers.common.quant_methods import MXFP4
+ from tpu_inference.layers.common.quantization import (
+     MXFP4_BLOCK_SIZE, MXFP4_REQUANTIZED_BLOCK_SIZE,
+@@ -143,6 +146,16 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
+         w2_weight_scale = t2j(layer.w2_weight_scale, use_dlpack=False)
+         w2_bias = t2j(layer.w2_bias, use_dlpack=False) if has_bias else None
+ 
++        expert_split = envs.MOE_TP_EXPERT_SPLIT
++        if expert_split > 1 and (self.moe_backend != MoEBackend.GMM_TP
++                                 or has_bias or layer.activation
++                                 == MoEActivation.SWIGLUOAI):
++            logger.warning_once(
++                "MOE_TP_EXPERT_SPLIT=%d only applies to GMM_TP without bias "
++                "or interleaved w13 (backend %s): keeping the GMM_TP layout.",
++                expert_split, self.moe_backend)
++            expert_split = 1
++
+         @jax.jit
+         def process_mxfp4_moe_weights(
+             w13_weight: jax.Array,
+@@ -191,12 +204,13 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
+                     desired_quant_dtype == jnp.float4_e2m1fn
+                     and requant_block_size == MXFP4_BLOCK_SIZE),
+             )
+-            return process_moe_weights(
++            weights = process_moe_weights(
+                 weights,
+                 moe_backend=self.moe_backend,
+                 w13_reorder_size=w13_reorder_size,
+                 w13_interleave=w13_interleave,
+             )
++            return weights
+ 
+         weights = process_mxfp4_moe_weights(
+             w13_weight,
+@@ -206,6 +220,28 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
+             w2_weight_scale,
+             w2_bias,
+         )
++        if expert_split > 1:
++            tp = get_mesh_shape_product(self.mesh, ShardingAxisName.MLP_TENSOR)
++            if not split_supported(weights.w13_weight.shape[0],
++                                   weights.w2_weight.shape[1], tp,
++                                   expert_split):
++                logger.warning_once(
++                    "MOE_TP_EXPERT_SPLIT=%d does not fit experts=%d "
++                    "intermediate=%d tp=%d: keeping the GMM_TP layout.",
++                    expert_split, weights.w13_weight.shape[0],
++                    weights.w2_weight.shape[1], tp)
++            else:
++                logger.info_once("[MoE]: MOE_TP_EXPERT_SPLIT=%d", expert_split)
++                # Module-level jit: compiled once, not per layer.
++                (weights.w13_weight, weights.w13_weight_scale,
++                 weights.w2_weight,
++                 weights.w2_weight_scale) = split_gmm_tp_weights_jit(
++                     weights.w13_weight,
++                     weights.w13_weight_scale,
++                     weights.w2_weight,
++                     weights.w2_weight_scale,
++                     tp=tp,
++                     split=expert_split)
+         weights = torch_view(
+             shard_moe_weights(weights, self.moe_backend, self.mesh))
+ 

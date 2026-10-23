@@ -1,0 +1,55 @@
+{
+ "n_devices": 32,
+ "jax": "0.11.2",
+ "dims": {
+  "H": 4096,
+  "I": 2048,
+  "E": 256,
+  "K": 6
+ },
+ "layers": 8,
+ "libtpu": "--enable_tpunetd_client=false  --xla_tpu_use_enhanced_launch_barrier=true",
+ "aot": "",
+ "interpret": false,
+ "device_kind": "TPU v6 lite",
+ "runs": {
+  "tpc4": {
+   "tokens": 128,
+   "fused_2048_2048_2048_512_1024_1024": {
+    "us_per_layer": 1041.1118128104135,
+    "min_us_per_layer": 1034.5587488700403,
+    "first_call_s": 9.146621470994432
+   },
+   "fused_2048_1024_1024_512_1024_1024": {
+    "us_per_layer": 1039.3431257398333,
+    "min_us_per_layer": 1034.197501212475,
+    "first_call_s": 8.978659732005326
+   },
+   "fusedg_2048_2048_2048_512_1024_1024": {
+    "us_per_layer": 1038.7043748778524,
+    "min_us_per_layer": 1036.7649992986117,
+    "first_call_s": 9.107988631003536
+   },
+   "fusedo_2048_2048_2048_512_1024_1024": {
+    "us_per_layer": 652.3880620079581,
+    "min_us_per_layer": 650.5074998131022,
+    "first_call_s": 8.752634404998389
+   },
+   "gmm_ep": {
+    "us_per_layer": 438.1700009616907,
+    "min_us_per_layer": 434.9337505118456,
+    "first_call_s": 41.93025199499971
+   },
+   "gmm_tp": {
+    "us_per_layer": 495.64375058253063,
+    "min_us_per_layer": 491.7687492707046,
+    "first_call_s": 2.8969354779983405
+   },
+   "fusedpo_2048_2048_2048_512_1024_1024": {
+    "us_per_layer": 624.1743749342277,
+    "min_us_per_layer": 620.4412511578994,
+    "first_call_s": 8.524412536993623
+   }
+  }
+ }
+}

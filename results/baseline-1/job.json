@@ -1,0 +1,28 @@
+{
+  "id": "baseline-1",
+  "owner": "dsv4-runner",
+  "kind": "e2e",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "0",
+    "TPU_TOKEN_PADDINGS_PER_DP": "4,16,512"
+  },
+  "serve_args_extra": [],
+  "acceptance": "exact",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": false,
+  "est_minutes": 60,
+  "abort_if": [
+    "post-ready RESOURCE_EXHAUSTED",
+    "launch-id mismatch",
+    "startup > 45 min"
+  ],
+  "success": "Exact saved B2/H4-r2 generated tokens and logprobs, exact H4-r2 teacher-forced prompt logprobs, repeat cache and suffix causality; measure 32-agent performance against 23.30 tok/s/user and 893k logical TPM.",
+  "fallback": null
+}

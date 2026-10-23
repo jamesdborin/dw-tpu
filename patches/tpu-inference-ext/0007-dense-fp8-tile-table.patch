@@ -1,0 +1,141 @@
+From 376a622846f58adf34dab4e4bf9b5ffc578ff83b Mon Sep 17 00:00:00 2001
+From: jamesdborin <james.dborin@doubleword.ai>
+Date: Thu, 22 Oct 2026 12:26:33 +0100
+Subject: [PATCH] dense gemm kernel-1 0001 + e2e-1 0002 json tiles
+
+---
+ .../kernels/experimental/dense_fp8.py         | 45 +++++++++++++-
+ .../kernels/experimental/dense_fp8_tiles.py   | 58 +++++++++++++++++++
+ 2 files changed, 101 insertions(+), 2 deletions(-)
+ create mode 100644 tpu_inference/kernels/experimental/dense_fp8_tiles.py
+
+diff --git a/tpu_inference/kernels/experimental/dense_fp8.py b/tpu_inference/kernels/experimental/dense_fp8.py
+index 673b07980..a345aaa5e 100644
+--- a/tpu_inference/kernels/experimental/dense_fp8.py
++++ b/tpu_inference/kernels/experimental/dense_fp8.py
+@@ -96,15 +96,56 @@ _TUNED = {(4, 1024, 8192): ('native', 4, 1024, 2048),
+  (512, 8192, 4096): ('megablox', 128, 1024, 2048)}
+ 
+ 
++
++# Full-row blocks are legal for odd M: no token-bucket rounding is required.
++# Newly covered rows are candidates pending the reservation-wide kernel gate.
++_DECODE_TILES = {
++    (1024, 32768): (1024, 2048),
++    (8192, 4096): (1024, 4096),
++    (4096, 4096): (4096, 1024),
++    (2048, 4096): (1024, 2048),
++    (4096, 1536): (4096, 512),
++    (1024, 8192): (1024, 2048),
++}
++
++
++_SUPPORTED_ROWS = frozenset(range(1, 33)) | {33, 64, 65, 128, 129, 256, 257, 512, 513}
++
++
++def select_tile(m, k, n):
++    """Exact old tiles first; extend to fine decode and speculative row counts.
++
++    This dispatch changes no scheduler bucket, input precision, or output shape.
++    The known losing M=512 fused-q_a/kv case retains the current kernel.
++    """
++    from tpu_inference.kernels.experimental.dense_fp8_tiles import overrides
++    table = overrides()
++    if (k, n) in _DECODE_TILES and (m, k, n) in table:
++        return table[m, k, n]
++    if (m, k, n) in _TUNED:
++        return _TUNED[m, k, n]
++    if (k, n) not in _DECODE_TILES or m not in _SUPPORTED_ROWS:
++        return None
++    if m <= 32:
++        tk, tn = _DECODE_TILES[k, n]
++        return 'native', m, tk, tn
++    if m in (64, 128, 256, 512):
++        if (k, n) == (4096, 1536):
++            return None  # Preserve the efficient existing prefill path.
++        return 'megablox', min(m, 128), 1024, 2048
++    # Non-power-of-two verification batches (including k+1). Keep M whole
++    # instead of selecting an illegal partial-row block or padding token rows.
++    return 'native', m, 1024, 512
++
+ def try_dense_fp8(x, weight, scale):
+-    """Return a qualified dense result, or None to retain the caller's fallback."""
++    """Return a supported dense result, or None to retain the caller's fallback."""
+     if x.dtype != jnp.bfloat16 or weight.dtype != jnp.float8_e4m3fn:
+         return None
+     if x.ndim != 2 or weight.ndim != 2 or scale.dtype != jnp.float32:
+         return None
+     m, k = x.shape
+     n = weight.shape[1]
+-    entry = _TUNED.get((m, k, n))
++    entry = select_tile(m, k, n)
+     if entry is None or weight.shape[0] != k:
+         return None
+     if scale.shape not in ((k // 128, 1, n), (1, k // 128, 1, n)):
+diff --git a/tpu_inference/kernels/experimental/dense_fp8_tiles.py b/tpu_inference/kernels/experimental/dense_fp8_tiles.py
+new file mode 100644
+index 000000000..664ea1848
+--- /dev/null
++++ b/tpu_inference/kernels/experimental/dense_fp8_tiles.py
+@@ -0,0 +1,58 @@
++"""Validated, immutable per-process dense FP8 tile overrides (no device work)."""
++import functools
++import json
++import os
++
++ROWS = frozenset(range(1, 34)) | {64, 65, 128, 129, 256, 257, 512, 513}
++SHAPES = {(1024, 32768), (8192, 4096), (4096, 4096), (2048, 4096),
++          (4096, 1536), (1024, 8192), (1024, 40960)}
++
++
++def validate_table(data):
++    if not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] != 1:
++        raise ValueError('dense FP8 tile table requires version=1')
++    if data.get('device') != 'TPU v6 lite':
++        raise ValueError('dense FP8 tile table requires TPU v6 lite')
++    if not isinstance(data.get('entries'), list):
++        raise ValueError('dense FP8 tile table requires entries list')
++    table = {}
++    for row in data['entries']:
++        if not isinstance(row, dict):
++            raise ValueError('tile entry must be an object')
++        dims = tuple(row.get(key) for key in ('m', 'k', 'n'))
++        if any(type(x) is not int for x in dims):
++            raise ValueError('tile dimensions must be integers')
++        m, k, n = dims
++        if m not in ROWS or (k, n) not in SHAPES or dims in table:
++            raise ValueError(f'unsupported or duplicate dense tile: {dims}')
++        mode = row.get('mode')
++        if mode == 'baseline':
++            table[dims] = None
++            continue
++        if mode not in ('native', 'megablox'):
++            raise ValueError('only native/megablox/baseline tiles are supported')
++        tile = tuple(row.get(key) for key in ('tm', 'tk', 'tn'))
++        if any(type(x) is not int or x <= 0 for x in tile):
++            raise ValueError('tile sizes must be positive integers')
++        tm, tk, tn = tile
++        if m % tm or k % tk or n % tn or tk % 128 or tn % 128:
++            raise ValueError('tile must divide dimensions; K/N tiles align to 128')
++        if tm != m and tm % 8:
++            raise ValueError('partial M tiles must align to 8')
++        if (k, n) == (1024, 40960) and mode != 'native':
++            raise ValueError('fusion search only qualifies native tiles')
++        table[dims] = (mode, tm, tk, tn)
++    return table
++
++
++@functools.lru_cache(maxsize=None)
++def _load(path):
++    # Read once: changing a file after tracing cannot change compiled executables.
++    with open(path, encoding='utf-8') as handle:
++        return validate_table(json.load(handle))
++
++
++def overrides():
++    """Set DSV4_DENSE_FP8_TILES before startup; absent means unchanged defaults."""
++    path = os.environ.get('DSV4_DENSE_FP8_TILES', '')
++    return _load(path) if path else {}
+-- 
+2.34.1
+

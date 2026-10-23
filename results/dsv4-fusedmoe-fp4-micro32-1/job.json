@@ -1,0 +1,18 @@
+{
+  "id": "dsv4-fusedmoe-fp4-micro32-1",
+  "owner": "dsv4-fusedmoe-fp4",
+  "kind": "micro32",
+  "base": "dw-tpu@1038ede853c094e4f96e4def6638135ed5bc44a5",
+  "depends_on": [],
+  "env": {},
+  "serve_args_extra": [],
+  "acceptance": "reduction-order",
+  "bench": null,
+  "profile": false,
+  "est_minutes": 10,
+  "abort_if": [
+    "any host still running after 15 min (run.sh: timeout 780 s, -k 10)"
+  ],
+  "success": "result.json (process 0) done=true or at least runs.tpc4 and runs.tpc32 complete (tpc 4,32,8): fused_* us_per_layer for both block configs, gmm_ep and gmm_tp us_per_layer; numerics fused_finite, fused_repeat_bitwise true, fused_vs_ref.rms <= 1.10 x gmm_ep_vs_ref.rms, maxabs <= 2 x.",
+  "fallback": null
+}

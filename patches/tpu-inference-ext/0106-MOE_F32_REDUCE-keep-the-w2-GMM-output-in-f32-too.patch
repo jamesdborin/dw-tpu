@@ -1,0 +1,32 @@
+From 9c856dfae59b5938f9750f3692537302ba2e76e8 Mon Sep 17 00:00:00 2001
+From: dsv4-moe-overlap <w@x>
+Date: Wed, 21 Oct 2026 08:46:05 +0100
+Subject: [PATCH 106/108] MOE_F32_REDUCE: keep the w2 GMM output in f32 too
+
+---
+ tpu_inference/layers/common/fused_moe_gmm.py | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index e68070ba1..43234c861 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -369,8 +369,16 @@ def moe_gmm_local(x: jax.Array,
+         shard_id = jax.lax.axis_index(ShardingAxisName.MLP_TENSOR).sum()
+         w2_bias = jnp.where(shard_id == 0, w2_bias, 0)
+     gmm1_res = gmm1_res[:, :w2.shape[1]]  # trim to hidden size if padded
+-    gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
+-                           group_offset)
++    # MOE_F32_REDUCE: keep the down projection's f32 accumulator (no bf16
++    # rounding per expert slice before the f32 combine).
++    gmm2_res = gmm_wrapper(
++        gmm1_res,
++        w2,
++        w2_scale,
++        w2_bias,
++        group_sizes,
++        group_offset,
++        preferred_element_type=jnp.float32 if f32_reduce else None)
+ 
+     # Not gmm2_res.shape[0]: x may carry padding rows past the last group
+     # (RAGGED_GATHER_TRIM_ROWS=False).

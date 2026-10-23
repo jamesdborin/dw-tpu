@@ -1,0 +1,18 @@
+{
+  "id": "dsv4-moe-overlap-coll32-3",
+  "owner": "dsv4-moe-overlap",
+  "kind": "micro32",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [],
+  "env": {},
+  "serve_args_extra": [],
+  "acceptance": "exact",
+  "bench": null,
+  "profile": true,
+  "est_minutes": 8,
+  "abort_if": [
+    "any host still running after 15 min (run.sh: one mode, timeout 600 s, -k 10)"
+  ],
+  "success": "default.json has moe r{1,4}_<variant>.us_per_layer for base/packed/packed_osag/packed_osag_osrs/split2/split2_packed_osag_osrs/split2_osall_sef; packed and packed_osag bitwise_eq_base true; split_check finite with meanabs ~bf16 rounding.",
+  "fallback": null
+}

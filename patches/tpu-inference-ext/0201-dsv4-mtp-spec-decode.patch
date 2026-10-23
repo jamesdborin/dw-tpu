@@ -1,0 +1,2370 @@
+diff --git a/tests/core/test_dp_scheduler_batch_prefill_wait.py b/tests/core/test_dp_scheduler_batch_prefill_wait.py
+new file mode 100644
+index 000000000..5677d2445
+--- /dev/null
++++ b/tests/core/test_dp_scheduler_batch_prefill_wait.py
+@@ -0,0 +1,97 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Batch-prefill admission with DP_SCHED_BATCH_PREFILL_IDLE_FLUSH=0."""
++from types import SimpleNamespace
++from unittest import mock
++
++from tpu_inference.core.sched import dp_scheduler
++from tpu_inference.core.sched.dp_scheduler import DPScheduler
++
++DP = 4
++
++
++def make(idle_flush, max_wait_ms, idle_ranks):
++    s = DPScheduler.__new__(DPScheduler)
++    s.dp_size = DP
++    s._batch_prefills = True
++    s._batch_prefill_threshold = DP
++    s._batch_prefill_flush_timeout_ms = 30000
++    s._batch_prefill_last_flush = 1000.0
++    s._batch_prefill_idle_flush = idle_flush
++    s._batch_prefill_max_wait_ms = max_wait_ms
++    s._batch_prefill_pending_since = 0.0
++    s._pending_new_requests = []
++    s.cached_schedulers_output = [[
++        SimpleNamespace(total_num_scheduled_tokens=0 if r < idle_ranks else 4)
++        for r in range(DP)
++    ]]
++    s.flushed = []
++
++    def flush():
++        s.flushed.append(len(s._pending_new_requests))
++        s._pending_new_requests = []
++        s._batch_prefill_last_flush = clock[0]
++
++    s._flush_pending = flush
++    return s
++
++
++clock = [1000.0]
++
++
++def add(s, n=1):
++    for _ in range(n):
++        with mock.patch.object(dp_scheduler, "time", lambda: clock[0]):
++            if not s._pending_new_requests:
++                s._batch_prefill_pending_since = clock[0]
++            s._pending_new_requests.append(object())
++            s._try_flush_pending()
++
++
++def tick(s, dt_ms):
++    clock[0] += dt_ms / 1000.0
++    with mock.patch.object(dp_scheduler, "time", lambda: clock[0]):
++        s._try_flush_pending()
++
++
++def test_default_idle_trigger_admits_one_by_one():
++    s = make(True, 0, idle_ranks=1)
++    add(s)
++    assert s.flushed == [1]
++
++
++def test_wait_for_threshold_when_idle_flush_disabled():
++    s = make(False, 2000, idle_ranks=1)
++    add(s, DP - 1)
++    tick(s, 100)
++    assert s.flushed == []  # one idle rank no longer admits a lone request
++    add(s)
++    assert s.flushed == [DP]  # whole turn admitted together
++
++
++def test_max_wait_bounds_the_delay():
++    s = make(False, 2000, idle_ranks=2)
++    add(s, 2)
++    tick(s, 1999)
++    assert s.flushed == []
++    tick(s, 2)
++    assert s.flushed == [2]
++
++
++def test_all_ranks_idle_flushes_after_grace():
++    s = make(False, 2000, idle_ranks=DP)
++    add(s)
++    assert s.flushed == []
++    tick(s, 60)
++    assert s.flushed == [1]
+diff --git a/tests/models/vllm/experimental/test_deepseek_v4_mtp.py b/tests/models/vllm/experimental/test_deepseek_v4_mtp.py
+new file mode 100644
+index 000000000..a87f19544
+--- /dev/null
++++ b/tests/models/vllm/experimental/test_deepseek_v4_mtp.py
+@@ -0,0 +1,159 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""DeepSeek V4 MTP wrapper math vs the DeepSeek reference (CPU, torchax).
++
++The decoder block is stubbed (identity on the hc streams) so this checks only
++the MTP-specific parts: position-0 embedding mask, enorm, per-stream hnorm,
++``h_proj(h) + e_proj(e)[:, None]``, the MTP layer's own hc_head + norm, and
++the checkpoint-name mapping.
++"""
++import math
++from types import SimpleNamespace
++from unittest import mock
++
++import pytest
++import torch
++import torch.nn.functional as F
++import torchax
++from torchax.interop import jax_view, torch_view
++
++HIDDEN, HC, VOCAB, EPS = 64, 4, 96, 1e-6
++
++
++def ref_rmsnorm(x, w, eps=EPS):
++    x32 = x.float()
++    y = x32 * torch.rsqrt(x32.square().mean(-1, keepdim=True) + eps)
++    return (w.float() * y).to(x.dtype)
++
++
++def ref_hc_head(x, fn, scale, base, eps=EPS):
++    # DeepSeek model.py ParallelHead.hc_head, x: [T, hc, d]
++    shape, dtype = x.size(), x.dtype
++    xf = x.flatten(1).float()
++    rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
++    mixes = F.linear(xf, fn) * rsqrt
++    pre = torch.sigmoid(mixes * scale + base) + eps
++    return torch.sum(pre.unsqueeze(-1) * xf.view(shape), dim=1).to(dtype)
++
++
++class StubBlock(torch.nn.Module):
++
++    def __init__(self, *args, **kwargs):
++        super().__init__()
++
++    def forward(self, x, positions, input_ids, *args):
++        return x, None, None, None
++
++
++@pytest.fixture
++def mtp_layer():
++    from vllm.config import VllmConfig, set_current_vllm_config
++
++    from tpu_inference.models.vllm.experimental import deepseek_v4_mtp
++    config = SimpleNamespace(hidden_size=HIDDEN,
++                             rms_norm_eps=EPS,
++                             hc_eps=EPS,
++                             hc_mult=HC,
++                             vocab_size=VOCAB)
++    from vllm.platforms import current_platform
++    with mock.patch.object(type(current_platform), "check_and_update_config"):
++        vllm_config = VllmConfig()
++    vllm_config.model_config = SimpleNamespace(hf_config=config)
++    vllm_config.quant_config = None
++    with set_current_vllm_config(vllm_config), mock.patch.object(
++            deepseek_v4_mtp, "DeepseekV4DecoderLayer", StubBlock), \
++            mock.patch.object(deepseek_v4_mtp, "ReplicatedLinear",
++                              lambda i, o, **kw: torch.nn.Linear(
++                                  i, o, bias=False)), \
++            mock.patch.object(deepseek_v4_mtp, "ParallelLMHead",
++                              lambda v, h, **kw: torch.nn.Linear(
++                                  h, v, bias=False)):
++        layer = deepseek_v4_mtp.DeepSeekV4MultiTokenPredictorLayer(
++            vllm_config, None, "model.layers.43")
++    g = torch.Generator().manual_seed(0)
++    with torch.no_grad():
++        for p in layer.parameters():
++            p.copy_(torch.randn(p.shape, generator=g) * 0.5)
++        layer.hc_head_scale.fill_(0.7)
++    return layer
++
++
++def test_mtp_wrapper_matches_reference(mtp_layer):
++    layer = mtp_layer
++    T = 6
++    g = torch.Generator().manual_seed(1)
++    emb = torch.randn(T, HIDDEN, generator=g)
++    prev = torch.randn(T, HC * HIDDEN, generator=g) * 3
++    positions = torch.tensor([0, 1, 2, 7, 0, 9])
++    input_ids = torch.arange(T)
++
++    # Reference (DeepSeek model.py MTPBlock, with vLLM's pos==0 mask).
++    e = torch.where(positions[:, None] == 0, torch.zeros_like(emb), emb)
++    e = ref_rmsnorm(e, layer.enorm.weight)
++    h = ref_rmsnorm(prev.view(T, HC, HIDDEN), layer.hnorm.weight)
++    x = F.linear(e, layer.e_proj.weight).unsqueeze(1) + F.linear(
++        h, layer.h_proj.weight)
++    ref_out = x.flatten(1)
++    ref_head_in = ref_rmsnorm(
++        ref_hc_head(x, layer.hc_head_fn, layer.hc_head_scale,
++                    layer.hc_head_base), layer.shared_head.norm.weight)
++
++    from vllm.ir import enable_torch_wrap
++    with torchax.default_env(), enable_torch_wrap(False):
++        layer_j = __import__("copy").deepcopy(layer).to("jax")
++        out = layer_j(input_ids.to("jax"), positions.to("jax"),
++                      prev.to("jax"), emb.to("jax"))
++        head_in = layer_j.pre_head(out)
++        out = torch.from_numpy(
++            __import__("numpy").asarray(jax_view(out).astype("float32")))
++        head_in = torch.from_numpy(
++            __import__("numpy").asarray(
++                jax_view(head_in).astype("float32")))
++    torch.testing.assert_close(out, ref_out, rtol=1e-5, atol=1e-5)
++    # The TPU hc_head op returns bf16.
++    torch.testing.assert_close(head_in, ref_head_in, rtol=2e-2, atol=2e-2)
++    # The pos==0 rows really were masked (differ from the unmasked result).
++    unmasked = F.linear(ref_rmsnorm(emb, layer.enorm.weight),
++                        layer.e_proj.weight)
++    assert not torch.allclose(
++        ref_out.view(T, HC, HIDDEN)[0] -
++        F.linear(h[0], layer.h_proj.weight), unmasked[0].expand(HC, -1))
++
++
++def test_checkpoint_name_mapping():
++    from tpu_inference.models.vllm.experimental.deepseek_v4_mtp import \
++        DeepSeekV4MTP
++    m = DeepSeekV4MTP.__new__(DeepSeekV4MTP)
++    torch.nn.Module.__init__(m)
++    m.config = SimpleNamespace(expert_dtype="fp4")
++    m.model = SimpleNamespace(num_mtp_layers=1, mtp_start_layer_idx=43)
++    f = m.checkpoint_name_to_param_name
++    assert f("layers.3.attn.wkv.weight") is None
++    assert f("mtp.1.enorm.weight") is None
++    assert f("head.weight") is None and f("embed.weight") is None
++    assert f("mtp.0.enorm.weight") == "model.layers.43.enorm.weight"
++    assert f("mtp.0.norm.weight") == "model.layers.43.shared_head.norm.weight"
++    assert f("mtp.0.e_proj.scale") == "model.layers.43.e_proj.weight_scale_inv"
++    assert f("mtp.0.hc_head_fn") == "model.layers.43.hc_head_fn"
++    assert f("mtp.0.attn_norm.weight") == \
++        "model.layers.43.mtp_block.attn_norm.weight"
++    assert f("mtp.0.attn.kv_norm.weight") == \
++        "model.layers.43.mtp_block.attn.kv_norm.weight"
++    assert f("mtp.0.hc_attn_fn") == "model.layers.43.mtp_block.hc_attn_fn"
++    assert f("mtp.0.ffn.experts.7.w2.scale") == \
++        "model.layers.43.mtp_block.ffn.experts.7.w2.weight_scale"
++    assert f("mtp.0.ffn.shared_experts.w2.scale") == \
++        "model.layers.43.mtp_block.ffn.shared_experts.down_proj.weight_scale_inv"
++    assert f("mtp.0.ffn.gate.bias") == \
++        "model.layers.43.mtp_block.ffn.gate.e_score_correction_bias"
+diff --git a/tests/spec_decode/mp_dsv4_spec_runner_trace.py b/tests/spec_decode/mp_dsv4_spec_runner_trace.py
+new file mode 100644
+index 000000000..8dd060674
+--- /dev/null
++++ b/tests/spec_decode/mp_dsv4_spec_runner_trace.py
+@@ -0,0 +1,453 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Multi-process CPU trace of the DSV4 MTP speculative-decoding request path.
++
++Emulates the multi-host serving setup on CPU: 2 JAX processes x 2 CPU devices
++(jax.distributed on localhost), attention DP = 4, TPU_MULTIHOST_BACKEND=ray
++(host->device puts go through make_array_from_callback) and
++TPU_ASYNC_REPLICATE_OUTPUTS=1, async scheduling, k = 3 MTP drafts. Arrays
++spanning the other process's devices are non-addressable, so any host read of
++a global array fails exactly as on the 8-host slice.
++
++The real TPUModelRunner runs end to end: execute_model (_prepare_inputs,
++target step via the real VllmModelWrapper/get_model path) -> sample_tokens
++(_sample_from_logits: bonus sampling, rejection sampler, logprobs, prompt
++logprobs, async replicated outputs) -> SpeculativeDecodingManager ->
++DeepseekV4MtpProposer (prepare_inputs/propose through the real draft step)
++-> AsyncTPUModelRunnerOutput.get_output, over several async steps with the
++runner's own placeholder substitution and rejection correction. Only
++`VllmModelWrapper.load_weights` is replaced by tiny torch models:
++
++  target:  next(x_t) = (7 * x_t + t) mod V (one-hot logits), aux hidden = x
++  draft:   MTP slot i (input x_{i+1}, pos i) predicts (7 x_{i+1} + i + 1) mod V,
++           i.e. the target's rule, except positions = 5 mod 6 are corrupted,
++           so steps see accepted and rejected drafts.
++
++The request mirrors the acceptance probe: an 8-token prompt, greedy, logprobs
++and prompt_logprobs (echo). Greedy outputs must equal the target's rule.
++
++Run: python mp_dsv4_spec_runner_trace.py <ckpt-config-dir>  (spawns 2 procs)
++SPECDEC_TRACE_MODE=sample runs the temperature-1 / logprobs=20 variant.
++"""
++import os
++import subprocess
++import sys
++import tempfile
++
++N_PROC, DEV_PER_PROC, K = 2, 2, 3
++PROMPT = [11, 23, 5, 17, 2, 9, 31, 4]
++MAX_TOKENS = 20
++MTP_LAYER = "model.layers.43.attn.swa_cache"
++OTHER_LAYER = "model.layers.0.attn.swa_cache"
++
++
++def main_driver(cfg_dir):
++    port = 47000 + os.getpid() % 1000
++    env = dict(os.environ,
++               JAX_PLATFORMS="cpu",
++               XLA_FLAGS=f"--xla_force_host_platform_device_count={DEV_PER_PROC}",
++               NEW_MODEL_DESIGN="1",
++               MODEL_IMPL_TYPE="vllm",
++               DRAFT_MODEL_IMPL_TYPE="vllm",
++               TPU_MULTIHOST_BACKEND="ray",
++               TPU_ASYNC_REPLICATE_OUTPUTS="1",
++               SKIP_JAX_PRECOMPILE="1",
++               TPU_TOKEN_PADDINGS_PER_DP="4,8,16",
++               SPECDEC_TRACE_PORT=str(port))
++    procs = [
++        subprocess.Popen([sys.executable, __file__, cfg_dir, str(i)], env=env)
++        for i in range(N_PROC)
++    ]
++    codes = [p.wait(timeout=900) for p in procs]
++    print("process exit codes", codes)
++    sys.exit(max(codes))
++
++
++def worker(cfg_dir, pid):
++    import jax
++    jax.distributed.initialize(
++        f"127.0.0.1:{os.environ['SPECDEC_TRACE_PORT']}",
++        num_processes=N_PROC,
++        process_id=pid)
++    import numpy as np
++    import torch
++    from torchax.interop import jax_view
++    from vllm.config import set_current_vllm_config
++    from vllm.engine.arg_utils import EngineArgs
++    from vllm.forward_context import get_forward_context
++    from vllm.sampling_params import SamplingParams
++    from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
++    from vllm.v1.kv_cache_interface import (KVCacheConfig, KVCacheGroupSpec,
++                                            SlidingWindowSpec)
++
++    from tpu_inference.core.sched.dp_scheduler import DPSchedulerOutput
++    from tpu_inference.layers.common.sharding import ShardingAxisName
++    from tpu_inference.models.vllm import vllm_model_wrapper as wm
++    from tpu_inference.models.vllm.experimental import register_models
++    from tpu_inference.models.vllm.vllm_model_wrapper_context import \
++        get_vllm_model_wrapper_context
++    from tpu_inference.runner.tpu_runner import TPUModelRunner
++    register_models()
++
++    ea = EngineArgs(
++        model=cfg_dir,
++        tokenizer=cfg_dir,
++        load_format="dummy",
++        speculative_config={
++            "method": "mtp",
++            "num_speculative_tokens": K,
++            "disable_eagle_block_drop": True
++        },
++        max_model_len=64,
++        max_num_batched_tokens=16,
++        max_num_seqs=2,
++        kv_cache_dtype="fp8",
++        enable_prefix_caching=True,
++        tensor_parallel_size=N_PROC * DEV_PER_PROC,
++        tokenizer_mode="deepseek_v4",
++        additional_config={
++            "sharding": {
++                "sharding_strategy": {
++                    "enable_dp_attention": True
++                }
++            }
++        })
++    cfg = ea.create_engine_config()
++    cfg.cache_config.block_size = 16
++    assert cfg.scheduler_config.async_scheduling
++
++    BS = 16
++
++    class ToyTarget(torch.nn.Module):
++
++        def __init__(self, vocab):
++            super().__init__()
++            self.vocab = vocab
++            self.bias = torch.nn.Parameter(torch.zeros(vocab),
++                                           requires_grad=False)
++            # Stand-ins for the parameters the MTP drafter shares.
++            self.model = torch.nn.Module()
++            self.model.embed_tokens = torch.nn.Embedding(4, 4)
++            self.lm_head = torch.nn.Linear(4, 4, bias=False)
++
++        def forward(self,
++                    input_ids,
++                    positions,
++                    intermediate_tensors=None,
++                    inputs_embeds=None):
++            nxt = (input_ids * 7 + positions) % self.vocab
++            # Scale 100: probability ~1 on the rule's token even at
++            # temperature 1 over the full 129k vocabulary.
++            h = torch.nn.functional.one_hot(nxt, self.vocab).to(
++                torch.bfloat16) * 100
++            aux = torch.nn.functional.one_hot(input_ids % 64, 64).to(
++                torch.bfloat16)
++            return h, [aux]
++
++        def compute_logits(self, h):
++            return h.to(torch.float32) + self.bias
++
++    class ToyDraft(torch.nn.Module):
++
++        def __init__(self, vocab):
++            super().__init__()
++            self.vocab = vocab
++            self.bias = torch.nn.Parameter(torch.zeros(vocab),
++                                           requires_grad=False)
++
++        def forward(self,
++                    input_ids,
++                    positions,
++                    hidden_states,
++                    intermediate_tensors=None,
++                    inputs_embeds=None,
++                    spec_step_idx=0):
++            md = get_forward_context().attn_metadata[MTP_LAYER]
++            ctx = get_vllm_model_wrapper_context()
++            idx = ctx.layer_name_to_kvcache_index[MTP_LAYER]
++            from jax.sharding import PartitionSpec as P
++            import jax.numpy as jnp
++
++            def write(ids, pos, qsl, bt, dist, cache):
++                t = jnp.arange(ids.shape[0])
++                n = dist[2]
++                nreq = qsl.shape[0] - 1
++                stride = bt.shape[0] // nreq
++                req = jnp.minimum(jnp.searchsorted(qsl[1:], t, side="right"),
++                                  nreq - 1)
++                valid = t < qsl[n]
++                slot = bt[req * stride + pos // BS] * BS + pos % BS
++                slot = jnp.where(valid, slot, cache.shape[0])
++                return cache.at[slot].set(ids + 1, mode="drop")
++
++            data = P(ShardingAxisName.ATTN_DATA)
++            ctx.kv_caches[idx] = jax.shard_map(
++                write, mesh=ctx.mesh, in_specs=(data, ) * 6,
++                out_specs=data)(jax_view(input_ids), jax_view(positions),
++                                md.query_start_loc, md.block_tables,
++                                md.request_distribution, ctx.kv_caches[idx])
++            d = (input_ids * 7 + positions + 1) % self.vocab
++            d = torch.where(positions % 6 == 5, (d + 1) % self.vocab, d)
++            return torch.nn.functional.one_hot(d, self.vocab).to(
++                torch.bfloat16) * 10
++
++        def compute_logits(self, h):
++            return h.to(torch.float32) + self.bias
++
++    def fake_load_weights(self, shared_params=None):
++        import jax.numpy as jnp
++        from jax.sharding import NamedSharding, PartitionSpec
++        vocab = 129280
++        if self.is_draft_model:
++            self.model = wm._VllmRunner(ToyDraft(vocab))
++            names = ["vllm_model.bias"]
++        else:
++            self.model = wm._VllmRunner(ToyTarget(vocab))
++            names = [
++                "vllm_model.bias", "vllm_model.model.embed_tokens.weight",
++                "vllm_model.lm_head.weight"
++            ]
++        rep = NamedSharding(self.mesh, PartitionSpec())
++        params = {
++            "vllm_model.bias":
++            jax.device_put(jnp.zeros((vocab, ), jnp.float32), rep)
++        }
++        for n in names[1:]:
++            params[n] = jax.device_put(jnp.zeros((4, 4), jnp.float32), rep)
++        if self.is_draft_model:
++            assert shared_params and set(shared_params) == {
++                "vllm_model.model.embed_tokens.weight",
++                "vllm_model.model.layers.43.shared_head.head.weight"
++            }, shared_params
++        self._pooler = None
++        self._mm_encoder_jit_manager = None
++        return params, None
++
++    wm.VllmModelWrapper.load_weights = fake_load_weights
++    # CPU XLA rejects the TPU-only compiler options; same programs otherwise.
++    wm.get_step_fn_compiler_options = lambda: {}
++    from tpu_inference.spec_decode.jax import dsv4_mtp
++    dsv4_mtp.DeepseekV4MtpProposer._propose_dsv4 = jax.jit(
++        dsv4_mtp.DeepseekV4MtpProposer._propose_dsv4.__wrapped__,
++        donate_argnames=("kv_caches", ),
++        static_argnums=(0, 7, 8))
++    wm.VllmModelWrapper.__init__.__globals__["get_tpu_quantization_config"] = (
++        lambda *a, **k: None)
++
++    with set_current_vllm_config(cfg):
++        runner = TPUModelRunner(cfg, jax.devices())
++        assert runner.dp_size == N_PROC * DEV_PER_PROC, runner.dp_size
++        runner.load_model()
++
++        # Two SWA groups; the MTP layer is NOT in the last group's position 0
++        # and its block table differs from the other group's.
++        spec = SlidingWindowSpec(block_size=BS,
++                                 num_kv_heads=1,
++                                 head_size=128,
++                                 dtype=torch.bfloat16,
++                                 sliding_window=64)
++        kvc = KVCacheConfig(num_blocks=16,
++                            kv_cache_tensors=[],
++                            kv_cache_groups=[
++                                KVCacheGroupSpec([OTHER_LAYER], spec),
++                                KVCacheGroupSpec([MTP_LAYER], spec),
++                            ])
++        mgr = runner.kv_cache_manager
++
++        def init_kv(kv_cache_config):
++            from jax.sharding import NamedSharding, PartitionSpec
++            mgr.maybe_reinitialize_input_batch(kv_cache_config)
++            sh = NamedSharding(runner.mesh,
++                               PartitionSpec(ShardingAxisName.BATCH))
++            runner.kv_caches.extend(
++                jax.make_array_from_callback(
++                    (runner.dp_size * 16 * BS, ), sh,
++                    lambda i: np.zeros(runner.dp_size * 16 * BS, np.int32)[i])
++                for _ in range(2))
++            runner.layer_name_to_kvcache_index.update({
++                OTHER_LAYER: 0,
++                MTP_LAYER: 1
++            })
++
++        mgr.initialize_kv_cache = init_kv
++        runner.initialize_kv_cache(kvc)
++
++        sample_mode = os.environ.get("SPECDEC_TRACE_MODE") == "sample"
++        if sample_mode:
++            # spec_acceptance.py: temperature 1, top-20 logprobs, no echo.
++            sp = SamplingParams(temperature=1.0,
++                                top_p=1.0,
++                                max_tokens=MAX_TOKENS,
++                                logprobs=20,
++                                ignore_eos=True)
++        else:
++            # runner probe: greedy, logprobs + prompt logprobs (echo).
++            sp = SamplingParams(temperature=0.0,
++                                max_tokens=MAX_TOKENS,
++                                logprobs=10,
++                                prompt_logprobs=10,
++                                ignore_eos=True)
++        # Two concurrent requests on ranks owned by different processes
++        # (rank 3 -> process 1, rank 0 -> process 0); rank 1/2 stay empty.
++        REQS = {"probe-0": (3, list(PROMPT)),
++                "probe-1": (0, [7, 3, 19, 41, 5, 13, 2, 29])}
++        RIDS = list(REQS)
++        per_rank = {r: [] for r in range(runner.dp_size)}
++        for rid, (rank, _) in REQS.items():
++            per_rank[rank].append(rid)
++
++        def sched(new=(), cached=None, n=0, spec_toks=None):
++            return DPSchedulerOutput(
++                scheduled_new_reqs=list(new),
++                scheduled_cached_reqs=cached or CachedRequestData.make_empty(),
++                num_scheduled_tokens={rid: n for rid in RIDS},
++                total_num_scheduled_tokens=n * len(RIDS),
++                scheduled_spec_decode_tokens=({
++                    rid: spec_toks for rid in RIDS
++                } if spec_toks else {}),
++                scheduled_encoder_inputs={},
++                num_common_prefix_blocks=[0, 0],
++                finished_req_ids=set(),
++                free_encoder_mm_hashes=[],
++                assigned_dp_rank={rid: REQS[rid][0] for rid in RIDS},
++                max_num_scheduled_tokens_per_dp_rank=n,
++                req_ids_per_rank=per_rank,
++            )
++
++        def cached(computed, out_tokens):
++            return CachedRequestData(req_ids=RIDS,
++                                     resumed_req_ids=set(),
++                                     new_token_ids=[[] for _ in RIDS],
++                                     all_token_ids={},
++                                     new_block_ids=[None for _ in RIDS],
++                                     num_computed_tokens=[computed[r] for r in RIDS],
++                                     num_output_tokens=[out_tokens[r] for r in RIDS])
++
++        # Async engine loop with one step in flight (as the batch queue).
++        generated = {rid: [] for rid in RIDS}
++        step_counts = []
++        computed = {}
++        pending = []  # (async_output, num_drafts_scheduled, sched_output)
++        from types import SimpleNamespace
++        from tpu_inference.core.sched.dp_scheduler import DPScheduler
++        ns = SimpleNamespace(dp_size=runner.dp_size)
++        ns._slice_logprobs = DPScheduler._slice_logprobs  # staticmethod
++
++        def drain_one():
++            out, drafts, so_k = pending.pop(0)
++            res = out.get_output()
++            # Engine side: the DP scheduler splits outputs per rank, including
++            # variable-length (speculative) logprobs.
++            by_rank = DPScheduler._split_model_output_by_rank(ns, so_k, res)
++            for rid in RIDS:
++                rank_out = by_rank[REQS[rid][0]]
++                j = rank_out.req_id_to_index[rid]
++                toks = res.sampled_token_ids[res.req_id_to_index[rid]]
++                assert rank_out.sampled_token_ids[j] == toks
++                if rank_out.logprobs is not None:
++                    lpl = rank_out.logprobs
++                    cu = lpl.cu_num_generated_tokens
++                    a, b = (cu[j], cu[j + 1]) if cu is not None else (j, j + 1)
++                    got = lpl.logprob_token_ids[a:b, 0].tolist()
++                    assert got == toks, ("logprob token ids", rid, got,
++                                         "sampled", toks, "cu", cu)
++                    # Near-one-hot target: the sampled token's logprob is ~0
++                    # and it is the top-1 entry.
++                    lp = np.asarray(lpl.logprobs)[a:b]
++                    assert (lp[:, 0] > -1e-2).all(), lp[:, :3]
++                    assert (lpl.logprob_token_ids[a:b, 1] ==
++                            lpl.logprob_token_ids[a:b, 0]).all()
++                assert 1 <= len(toks) <= drafts + 1, (toks, drafts)
++                computed[rid] -= drafts + 1 - len(toks)
++                generated[rid].extend(toks)
++                step_counts.append(len(toks))
++            return res
++
++        new = [
++            NewRequestData(req_id=rid,
++                           prompt_token_ids=prompt,
++                           mm_features=[],
++                           sampling_params=sp,
++                           pooling_params=None,
++                           block_ids=([1, 2, 3, 4], [5, 6, 7, 8]),
++                           num_computed_tokens=0,
++                           lora_request=None)
++            for rid, (_, prompt) in REQS.items()
++        ]
++        so0 = sched(new=new, n=len(PROMPT))
++        assert runner.execute_model(so0) is None
++        pending.append((runner.sample_tokens(None), 0, so0))
++        computed = {rid: len(PROMPT) for rid in RIDS}
++        first = None
++        steps = 0
++        while (max(len(g) for g in generated.values()) + 1 + K <= MAX_TOKENS
++               and steps < 12):
++            steps += 1
++            # Scheduler assumes all in-flight drafts accepted (placeholders).
++            n = 1 + K
++            # vLLM: num_output_tokens = outputs + in-flight placeholders
++            # (1 + drafts per unprocessed step).
++            placeholders = sum(d + 1 for _, d, _ in pending)
++            so = sched(cached=cached(
++                computed,
++                {r: len(generated[r]) + placeholders
++                 for r in RIDS}),
++                       n=n,
++                       spec_toks=[-1] * K)
++            import logging, time
++            if steps >= 4:
++                print(f"STEP {steps} BEGIN", flush=True)
++            t0 = time.perf_counter()
++            assert runner.execute_model(so) is None
++            pending.append((runner.sample_tokens(None), K, so))
++            if steps >= 4:
++                print(f"STEP {steps} END host {1e3*(time.perf_counter()-t0):.1f} ms", flush=True)
++            for r in RIDS:
++                computed[r] += n
++            res = drain_one()
++            if first is None:
++                first = res
++        while pending:
++            drain_one()
++
++        for rid, (_, prompt) in REQS.items():
++            ref = []
++            x, t = prompt[-1], len(prompt) - 1
++            for _ in range(len(generated[rid])):
++                x = (x * 7 + t) % 129280
++                ref.append(x)
++                t += 1
++            if jax.process_index() == 0:
++                print(rid, "generated", generated[rid])
++            assert generated[rid] == ref, (rid, generated[rid], ref)
++            if not sample_mode:
++                plp = first.prompt_logprobs_dict.get(rid)
++                assert plp is not None and plp.logprobs.shape[0] == len(
++                    prompt) - 1, plp
++        if jax.process_index() == 0:
++            print("tokens per step", step_counts)
++        if sample_mode:
++            print(f"proc {jax.process_index()} TRACE OK (sample)", flush=True)
++            return
++        # Both full acceptance (k+1) and rejection (<k+1) must occur.
++        assert max(step_counts) == K + 1 and min(step_counts[2:]) < K + 1, \
++            step_counts
++        print(f"proc {jax.process_index()} TRACE OK", flush=True)
++
++
++if __name__ == "__main__":
++    if len(sys.argv) == 2:
++        main_driver(sys.argv[1])
++    else:
++        worker(sys.argv[1], int(sys.argv[2]))
+diff --git a/tests/spec_decode/test_dsv4_mtp_proposer.py b/tests/spec_decode/test_dsv4_mtp_proposer.py
+new file mode 100644
+index 000000000..70e2e7e78
+--- /dev/null
++++ b/tests/spec_decode/test_dsv4_mtp_proposer.py
+@@ -0,0 +1,371 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""CPU test of the DeepSeek V4 MTP proposer glue under attention DP.
++
++Runs the real ``DeepseekV4MtpProposer`` (prepare_inputs + propose, k=3) and
++the real ``VllmModelWrapper`` draft step on a 4-device CPU mesh (attn_dp=4,
++one request per rank) with a toy torch draft model in place of the DSV4 MTP
++layer. The toy reads its own layer's entry of the GroupedAttentionMetadata,
++writes ``input_id + 1`` into its KV cache at the block-table slot of each
++token, and drafts ``g(input_id, position, argmax(hidden))``. The test checks
++the drafted tokens and the KV writes against a Python model of MTP chaining
++with per-rank rejection counts 0..3, and that the proposer picked the MTP
++layer's KV-cache group (not the last one) and its DP-ordered block table.
++
++Needs ``XLA_FLAGS=--xla_force_host_platform_device_count=4`` (or more) and
++``NEW_MODEL_DESIGN=1``.
++"""
++import os
++from types import SimpleNamespace
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++import pytest
++import torch
++from jax.sharding import NamedSharding
++from jax.sharding import PartitionSpec as P
++from torchax.interop import jax_view, torch_view
++from vllm.forward_context import get_forward_context
++
++from tpu_inference.layers.common.attention_metadata import (
++    AttentionMetadata, GroupedAttentionMetadata)
++from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
++                                                  ShardingAxisName)
++from tpu_inference.models.vllm.vllm_model_wrapper_context import \
++    get_vllm_model_wrapper_context
++
++DP = 4
++K = 3
++V = 16  # vocab == hidden size of the toy
++BS = 4  # KV block size
++MAX_BLOCKS = 4  # per request
++NUM_BLOCKS = 4  # per rank
++T_LOCAL = 4  # verify tokens per rank (1 req x (K + 1))
++MTP_LAYER = "model.layers.43.attn.swa_cache"
++OTHER_LAYER = "model.layers.0.attn.swa_cache"
++
++pytestmark = pytest.mark.skipif(
++    jax.device_count() < DP or os.environ.get("NEW_MODEL_DESIGN") != "1",
++    reason="needs >=4 (CPU) devices and NEW_MODEL_DESIGN=1")
++
++
++def g(token, position, hidden_argmax):
++    return (token * 3 + position + hidden_argmax) % V
++
++
++class ToyMTP(torch.nn.Module):
++
++    def __init__(self):
++        super().__init__()
++        self.bias = torch.nn.Parameter(torch.zeros(V), requires_grad=False)
++
++    def forward(self,
++                input_ids,
++                positions,
++                hidden_states,
++                intermediate_tensors=None,
++                inputs_embeds=None,
++                spec_step_idx=0):
++        md = get_forward_context().attn_metadata[MTP_LAYER]
++        ctx = get_vllm_model_wrapper_context()
++        idx = ctx.layer_name_to_kvcache_index[MTP_LAYER]
++
++        def write(ids, pos, qsl, bt, dist, cache):
++            t = jnp.arange(ids.shape[0])
++            n = dist[2]
++            req = jnp.searchsorted(qsl[1:], t, side="right")
++            valid = t < qsl[n]
++            req = jnp.minimum(req, bt.shape[0] // MAX_BLOCKS - 1)
++            slot = bt[req * MAX_BLOCKS + pos // BS] * BS + pos % BS
++            slot = jnp.where(valid, slot, cache.shape[0])
++            return cache.at[slot].set(ids + 1, mode="drop")
++
++        data = P(ShardingAxisName.ATTN_DATA)
++        ctx.kv_caches[idx] = jax.shard_map(
++            write,
++            mesh=ctx.mesh,
++            in_specs=(data, ) * 6,
++            out_specs=data,
++        )(jax_view(input_ids), jax_view(positions), md.query_start_loc,
++          md.block_tables, md.request_distribution, ctx.kv_caches[idx])
++
++        hidden_argmax = torch.argmax(hidden_states, dim=-1)
++        nxt = (input_ids * 3 + positions + hidden_argmax) % V
++        return torch.nn.functional.one_hot(nxt, V).to(
++            torch.float32) * 10 + self.bias
++
++    def compute_logits(self, hidden_states):
++        return hidden_states
++
++
++def _mesh():
++    shape = [1] * len(MESH_AXIS_NAMES)
++    shape[MESH_AXIS_NAMES.index("attn_dp")] = DP
++    devices = np.array(jax.devices()[:DP]).reshape(shape)
++    return jax.sharding.Mesh(devices, MESH_AXIS_NAMES)
++
++
++def _put(mesh, x, spec):
++    return jax.device_put(np.asarray(x), NamedSharding(mesh, spec))
++
++
++def test_dsv4_mtp_proposer_dp_chaining():
++    from tpu_inference.models.vllm.vllm_model_wrapper import (
++        VllmModelWrapper, _VllmRunner)
++    from tpu_inference.spec_decode.jax.dsv4_mtp import DeepseekV4MtpProposer
++
++    mesh = _mesh()
++    data = P(ShardingAxisName.ATTN_DATA)
++    rng = np.random.default_rng(0)
++
++    # ---------------------------------------------------------- draft model
++    spec_config = SimpleNamespace(
++        method="mtp",
++        num_speculative_tokens=K,
++        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(
++            num_hidden_layers=43, num_nextn_predict_layers=1)),
++        use_gemma4_mtp=lambda: False)
++    vllm_config = SimpleNamespace(
++        speculative_config=spec_config,
++        cache_config=SimpleNamespace(block_size=BS),
++        model_config=SimpleNamespace(seed=0),
++        lora_config=None,
++        compilation_config=SimpleNamespace(static_forward_context={}),
++        parallel_config=SimpleNamespace(data_parallel_size=1),
++    )
++    wrapper = VllmModelWrapper.__new__(VllmModelWrapper)
++    wrapper.vllm_config = vllm_config
++    wrapper.mesh = mesh
++    wrapper.is_draft_model = True
++    wrapper.model = _VllmRunner(ToyMTP())
++    params = {"vllm_model.bias": _put(mesh, np.zeros(V, np.float32), P())}
++
++    kv_caches = [
++        _put(mesh, np.zeros(DP * NUM_BLOCKS * BS, np.int32), data)
++        for _ in range(2)
++    ]
++    runner = SimpleNamespace(
++        mesh=mesh,
++        max_num_tokens=DP * T_LOCAL,
++        max_model_len=MAX_BLOCKS * BS,
++        kv_cache_config=SimpleNamespace(kv_cache_groups=[
++            SimpleNamespace(layer_names=[OTHER_LAYER]),
++            SimpleNamespace(layer_names=[MTP_LAYER]),
++            SimpleNamespace(layer_names=["model.layers.2.attn"]),
++        ]),
++        layer_name_to_kvcache_index={
++            OTHER_LAYER: 0,
++            MTP_LAYER: 1
++        },
++    )
++    # set_forward_context needs a real-ish VllmConfig only for DP metadata,
++    # which the toy does not use.
++    import vllm.forward_context as fc
++    orig_set_forward_context = fc.set_forward_context
++
++    from contextlib import contextmanager
++
++    @contextmanager
++    def _set_forward_context(attn_metadata, vllm_config, num_tokens=None):
++        prev = fc._forward_context
++        fc._forward_context = SimpleNamespace(attn_metadata=attn_metadata)
++        try:
++            yield
++        finally:
++            fc._forward_context = prev
++
++    import tpu_inference.models.vllm.vllm_model_wrapper as wrapper_module
++    wrapper_module.set_forward_context = _set_forward_context
++    try:
++        # Same program without the TPU-only compiler options.
++        cpu_propose = jax.jit(DeepseekV4MtpProposer._propose_dsv4.__wrapped__,
++                              static_argnums=(0, 7, 8))
++
++        class CpuProposer(DeepseekV4MtpProposer):
++            _propose_dsv4 = cpu_propose
++
++        proposer = CpuProposer.__new__(CpuProposer)
++        # Eagle3Proposer.__init__ minus vLLM config plumbing.
++        proposer.vllm_config = vllm_config
++        proposer.speculative_config = spec_config
++        proposer.draft_model_config = spec_config.draft_model_config
++        proposer.method = "mtp"
++        proposer.runner = runner
++        proposer.mesh = mesh
++        proposer.num_speculative_tokens = K
++        proposer.block_size = BS
++        proposer.max_num_tokens = runner.max_num_tokens
++        proposer.token_arange = jnp.arange(runner.max_num_tokens)
++        proposer.constant_draft_positions = False
++        proposer._draft_gid = None
++        proposer._draft_layer_names = None
++        proposer.model_fn = wrapper.jit_step_func()
++        proposer.compute_logits_fn = wrapper.jit_compute_logits_func()
++        proposer.state_leaves = params
++
++        # ------------------------------------------------ target step
++        p0 = np.array([5, 6, 7, 8])  # first verify position per rank
++        rejected = np.array([0, 1, 2, 3])
++        target_ids = rng.integers(0, V, size=(DP, T_LOCAL))
++        aux_argmax = rng.integers(0, V, size=(DP, T_LOCAL))
++        bonus = rng.integers(0, V, size=DP)
++        positions = (p0[:, None] + np.arange(T_LOCAL)[None]).reshape(-1)
++        aux = np.zeros((DP * T_LOCAL, V), np.float32)
++        aux[np.arange(DP * T_LOCAL), aux_argmax.reshape(-1)] = 5.0
++        # DP-ordered block tables: rank-local block ids, distinct per group.
++        bt_mtp = np.stack([rng.permutation(NUM_BLOCKS) for _ in range(DP)])
++        bt_other = np.stack([rng.permutation(NUM_BLOCKS) for _ in range(DP)])
++
++        def md(bt):
++            return AttentionMetadata(
++                input_positions=_put(mesh, positions, data),
++                block_tables=_put(mesh, bt.reshape(-1), data),
++                seq_lens=_put(mesh, p0 + T_LOCAL, data),
++                query_start_loc=_put(mesh, np.tile([0, T_LOCAL], DP), data),
++                request_distribution=_put(mesh, np.tile([0, 0, 1], DP), data),
++                padded_num_reqs=DP,
++            )
++
++        target_md = GroupedAttentionMetadata(
++            groups=(md(bt_other), md(bt_mtp), md(bt_other)),
++            layer_names_per_group=((OTHER_LAYER, ), (MTP_LAYER, ),
++                                   ("model.layers.2.attn", )),
++        )
++        (target_hidden, draft_ids_in, last_idx,
++         draft_md) = proposer.prepare_inputs(
++             target_md,
++             _put(mesh, target_ids.reshape(-1), data),
++             (_put(mesh, aux, P(ShardingAxisName.ATTN_DATA, None)), ),
++             _put(mesh, bonus, data),
++             _put(mesh, np.zeros(DP, np.int32), data),
++             _put(mesh, np.zeros(DP, np.int32), data),
++             _put(mesh, rejected, data),
++             _put(mesh, np.ones(DP, np.int32), data),
++         )
++        assert proposer._draft_gid == 1
++        kv_out, drafts = proposer.propose(kv_caches, draft_ids_in, draft_md,
++                                          last_idx, target_hidden)
++        drafts = np.asarray(drafts)
++        kv_mtp = np.asarray(kv_out[1]).reshape(DP, NUM_BLOCKS * BS)
++        kv_other = np.asarray(kv_out[0])
++    finally:
++        wrapper_module.set_forward_context = orig_set_forward_context
++
++    assert drafts.shape == (DP, K)
++    assert not kv_other.any(), "draft wrote into another layer's cache"
++    for r in range(DP):
++        accepted = T_LOCAL - rejected[r]
++        last = accepted - 1
++        inputs = [int(target_ids[r, i + 1]) for i in range(last)
++                  ] + [int(bonus[r])]
++        expected_kv = {}
++        for i in range(accepted):
++            expected_kv[p0[r] + i] = inputs[i] + 1
++        d = [g(int(bonus[r]), p0[r] + last, int(aux_argmax[r, last]))]
++        for j in range(1, K):
++            expected_kv[p0[r] + last + j] = d[-1] + 1
++            d.append(g(d[-1], p0[r] + last + j, d[-1]))
++        assert drafts[r].tolist() == d, (r, drafts[r], d)
++        for pos, value in expected_kv.items():
++            slot = bt_mtp[r, pos // BS] * BS + pos % BS
++            assert kv_mtp[r, slot] == value, (r, pos, kv_mtp[r], value)
++        assert int((kv_mtp[r] != 0).sum()) == len(expected_kv), (r, kv_mtp[r])
++
++
++def test_manager_passes_grouped_metadata_and_host_logits_indices():
++    """SpeculativeDecodingManager glue for the DSV4 MTP drafter.
++
++    * propose_eagle3_draft_token_ids must hand the drafter the full
++      GroupedAttentionMetadata (it picks its own KV group); the generic path
++      collapses it to the first layer's entry, i.e. another group's tables.
++    * get_spec_decode_metadata must keep a host copy of the final logits
++      indices: the runner writes it into its host buffer, and the device copy
++      spans every host's devices (not readable on multi-host).
++    """
++    from tpu_inference.runner.speculative_decoding_manager import \
++        SpeculativeDecodingManager
++    from tpu_inference.spec_decode.jax.dsv4_mtp import DeepseekV4MtpProposer
++
++    mesh = _mesh()
++    data = P(ShardingAxisName.ATTN_DATA)
++    seen = {}
++
++    class FakeDrafter(DeepseekV4MtpProposer):
++
++        def __init__(self):
++            pass
++
++        def prepare_inputs(self, attn_metadata, *args):
++            seen["md"] = attn_metadata
++            return "h", "ids", "last", "dmd"
++
++        def propose(self, kv_caches, **kwargs):
++            return kv_caches, jnp.zeros((DP, K), jnp.int32)
++
++    runner = SimpleNamespace(
++        drafter=FakeDrafter(),
++        speculative_config=SimpleNamespace(method="mtp",
++                                           num_speculative_tokens=K),
++        input_batch=SimpleNamespace(req_ids=[f"r{i}" for i in range(DP)]),
++        requests={},
++        dp_size=DP,
++        max_num_reqs=DP,
++        mesh=mesh,
++        kv_caches=["kv"],
++        arange_cpu=np.arange(64),
++    )
++    manager = SpeculativeDecodingManager(runner)
++
++    def md(tag):
++        return AttentionMetadata(
++            input_positions=_put(mesh, np.zeros(DP * T_LOCAL, np.int32),
++                                 data),
++            block_tables=_put(mesh, np.full(DP * MAX_BLOCKS, tag, np.int32),
++                              data),
++            seq_lens=_put(mesh, np.zeros(DP, np.int32), data),
++            query_start_loc=_put(mesh, np.zeros(2 * DP, np.int32), data),
++            request_distribution=_put(mesh, np.zeros(3 * DP, np.int32),
++                                      data),
++            padded_num_reqs=DP,
++        )
++
++    grouped = GroupedAttentionMetadata(
++        groups=(md(0), md(1)),
++        layer_names_per_group=((OTHER_LAYER, ), (MTP_LAYER, )))
++    # The runner calls these under jax.set_mesh (PartitionSpec placements).
++    mesh_ctx = jax.set_mesh(mesh)
++    mesh_ctx.__enter__()
++    spec_md = manager.get_spec_decode_metadata(
++        num_draft_tokens_dp=np.full(DP, K, np.int32),
++        dp_size=DP,
++        req_indices_dp={r: [r]
++                        for r in range(DP)},
++        req_ids_dp={r: [f"r{r}"]
++                    for r in range(DP)},
++        query_start_loc=np.tile([0, T_LOCAL], DP),
++        padded_num_reqs_per_dp_rank=1,
++        padded_logits_length_dp_rank=T_LOCAL,
++        max_num_reqs_per_dp_rank=1,
++    )
++    assert isinstance(spec_md.final_logits_indices_cpu, np.ndarray)
++    np.testing.assert_array_equal(spec_md.final_logits_indices_cpu,
++                                  np.tile(np.arange(T_LOCAL), DP))
++
++    out = manager.propose_eagle3_draft_token_ids(
++        spec_md, None, None, [], [jnp.zeros((DP * T_LOCAL, V))], grouped,
++        SimpleNamespace(num_scheduled_tokens={}), None, True, None)
++    mesh_ctx.__exit__(None, None, None)
++    assert seen["md"] is grouped
++    assert out.shape == (DP, K)
+diff --git a/tpu_inference/core/sched/dp_scheduler.py b/tpu_inference/core/sched/dp_scheduler.py
+index 3cdce8c96..21530b696 100644
+--- a/tpu_inference/core/sched/dp_scheduler.py
++++ b/tpu_inference/core/sched/dp_scheduler.py
+@@ -520,6 +520,18 @@ class DPScheduler(SchedulerInterface):
+         self._batch_prefill_flush_timeout_ms: int = (
+             envs.DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS)
+         self._batch_prefill_last_flush: float = time()
++        # Speculative decoding desynchronizes request completion (each step
++        # emits 1..k+1 tokens per request), so the "idle ranks >= pending"
++        # trigger admits agents one by one and every lone prefill chunk pads
++        # all DP ranks to a prefill bucket. With
++        # DP_SCHED_BATCH_PREFILL_IDLE_FLUSH=0 pending requests wait for the
++        # threshold, for DP_SCHED_BATCH_PREFILL_MAX_WAIT_MS since the oldest
++        # pending arrival, or (all ranks idle) a short grace period.
++        self._batch_prefill_idle_flush: bool = os.environ.get(
++            "DP_SCHED_BATCH_PREFILL_IDLE_FLUSH", "1") != "0"
++        self._batch_prefill_max_wait_ms: int = int(
++            os.environ.get("DP_SCHED_BATCH_PREFILL_MAX_WAIT_MS", "0"))
++        self._batch_prefill_pending_since: float = 0.0
+         self._pending_new_requests: List[Request] = []
+ 
+         # How new requests are assigned to ranks (envs.DP_SCHED_ROUTING,
+@@ -844,6 +856,8 @@ class DPScheduler(SchedulerInterface):
+             f"assigned to rank {self.assigned_dp_rank[request.request_id]})")
+ 
+         if self._batch_prefills:
++            if not self._pending_new_requests:
++                self._batch_prefill_pending_since = time()
+             self._pending_new_requests.append(request)
+             self._try_flush_pending()
+             return
+@@ -903,7 +917,17 @@ class DPScheduler(SchedulerInterface):
+         if elapsed_ms >= self._batch_prefill_flush_timeout_ms:
+             self._flush_pending()
+             return
+-        if self._count_idle_ranks() >= n:
++        if self._batch_prefill_idle_flush:
++            if self._count_idle_ranks() >= n:
++                self._flush_pending()
++            return
++        age_ms = (time() - self._batch_prefill_pending_since) * 1000.0
++        if (self._batch_prefill_max_wait_ms > 0
++                and age_ms >= self._batch_prefill_max_wait_ms):
++            self._flush_pending()
++            return
++        if (self._count_idle_ranks() == self.dp_size and age_ms >= min(
++                50.0, self._batch_prefill_max_wait_ms or 50.0)):
+             self._flush_pending()
+             return
+ 
+diff --git a/tpu_inference/models/vllm/experimental/__init__.py b/tpu_inference/models/vllm/experimental/__init__.py
+index a22732f43..56e73c6af 100644
+--- a/tpu_inference/models/vllm/experimental/__init__.py
++++ b/tpu_inference/models/vllm/experimental/__init__.py
+@@ -19,6 +19,8 @@
+ _TPU_VLLM_MODELS = {
+     "DeepseekV4ForCausalLM":
+     "tpu_inference.models.vllm.experimental.deepseek_v4:DeepseekV4ForCausalLM",
++    "DeepSeekV4MTPModel":
++    "tpu_inference.models.vllm.experimental.deepseek_v4_mtp:DeepSeekV4MTP",
+ }
+ 
+ 
+diff --git a/tpu_inference/models/vllm/experimental/deepseek_v4.py b/tpu_inference/models/vllm/experimental/deepseek_v4.py
+index c1fe183ed..c85beeccd 100644
+--- a/tpu_inference/models/vllm/experimental/deepseek_v4.py
++++ b/tpu_inference/models/vllm/experimental/deepseek_v4.py
+@@ -510,20 +510,13 @@ class DeepseekV4Model(nn.Module):
+             requires_grad=False,
+         )
+         self.hc_head_op = HCHeadOp()
+-        # Pre-hc_head residual stream buffer for the MTP draft. Stable
+-        # address (outside the cudagraph pool) so the copy_ in forward()
+-        # refreshes it correctly across captured shapes.
+-        # refreshes it correctly across captured shapes. Only allocated on
+-        # the last PP rank — that's where MTP target hidden states are
+-        # produced.
+-        if get_pp_group().is_last_rank:
+-            self._mtp_hidden_buffer = torch.empty(
+-                vllm_config.scheduler_config.max_num_batched_tokens,
+-                self.hc_dim,
+-                dtype=vllm_config.model_config.dtype,
+-            )
+-        else:
+-            self._mtp_hidden_buffer = None
++        # The MTP draft conditions on the pre-hc_head residual stream
++        # [T, hc_mult * hidden]. With MTP speculative decoding the forward
++        # returns it as an auxiliary hidden state next to the usual output
++        # (the logits path is unchanged).
++        spec_config = vllm_config.speculative_config
++        self.return_mtp_hidden = (spec_config is not None
++                                  and spec_config.method == "mtp")
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+@@ -583,8 +576,7 @@ class DeepseekV4Model(nn.Module):
+         if not get_pp_group().is_last_rank:
+             return IntermediateTensors({"hidden_states": hidden_states})
+ 
+-        # num_tokens = hidden_states.shape[0]
+-        # self._mtp_hidden_buffer[:num_tokens] = hidden_states.flatten(1)
++        mtp_hidden = hidden_states.flatten(1) if self.return_mtp_hidden else None
+ 
+         hidden_states = self.hc_head_op(
+             hidden_states,
+@@ -595,6 +587,8 @@ class DeepseekV4Model(nn.Module):
+             self.hc_eps,
+         )
+         hidden_states = self.norm(hidden_states)
++        if mtp_hidden is not None:
++            return hidden_states, [mtp_hidden]
+         return hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str,
+@@ -804,12 +798,6 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
+                                    inputs_embeds)
+         return hidden_states
+ 
+-    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+-        """Pre-hc_head residual stream buffer (max_num_batched_tokens,
+-        hc_mult * hidden_size) for the MTP draft model. Populated by
+-        forward(); valid after each target step."""
+-        return getattr(self.model, "_mtp_hidden_buffer", None)
+-
+     def load_weights(self, weights: Iterable[tuple[str,
+                                                    torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+diff --git a/tpu_inference/models/vllm/experimental/deepseek_v4_mtp.py b/tpu_inference/models/vllm/experimental/deepseek_v4_mtp.py
+new file mode 100644
+index 000000000..e48281729
+--- /dev/null
++++ b/tpu_inference/models/vllm/experimental/deepseek_v4_mtp.py
+@@ -0,0 +1,361 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TPU (torchax) MTP draft model for DeepSeek V4.
++
++Mirrors ``vllm.models.deepseek_v4.amd.mtp`` but builds the decoder block from
++the TPU ``DeepseekV4DecoderLayer`` (TPU MLA attention, TPU MoE, Pallas mHC)
++and replaces the triton fused MTP-input norm with its eager definition:
++
++    inputs_embeds = where(positions == 0, 0, inputs_embeds)
++    e = enorm(inputs_embeds)                      # [T, H]
++    h = hnorm(previous_hidden_states)             # [T, hc_mult, H], per stream
++    x = h_proj(h) + e_proj(e)[:, None]            # [T, hc_mult, H]
++    x = mtp_block(x)                              # one V4 decoder layer
++    return x.flatten(1)                           # pre-hc_head residual
++
++``compute_logits`` applies the MTP layer's own ``hc_head`` + ``norm`` and the
++LM head (shared with the target). The MTP layer index is
++``num_hidden_layers`` (43), whose ``compress_ratios`` entry is 0, so its
++attention is sliding-window only (no compressor / indexer).
++"""
++import typing
++from collections.abc import Callable, Iterable
++
++import regex as re
++import torch
++import torch.nn as nn
++from vllm.config import VllmConfig
++from vllm.distributed import (get_tensor_model_parallel_rank,
++                              get_tensor_model_parallel_world_size)
++from vllm.model_executor.layers.fused_moe import \
++    fused_moe_make_expert_params_mapping
++from vllm.model_executor.layers.layernorm import RMSNorm
++from vllm.model_executor.layers.linear import ReplicatedLinear
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.mhc import HCHeadOp, MHCPostOp
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead, VocabParallelEmbedding)
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++from vllm.model_executor.models.utils import maybe_prefix
++
++from tpu_inference.logger import init_logger
++from tpu_inference.models.vllm.experimental.deepseek_v4 import \
++    DeepseekV4DecoderLayer
++
++logger = init_logger(__name__)
++
++# fp4 experts (Mxfp4MoEMethod) register ``w{1,2,3}_weight_scale``; every other
++# FP8 block scale registers ``weight_scale_inv`` (see
++# ``_make_deepseek_v4_weights_mapper`` in deepseek_v4.py).
++_EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
++
++# Checkpoint names that belong to the MTP wrapper rather than to its decoder
++# block (``mtp_block``).
++_MTP_WRAPPER_WEIGHTS = ("enorm.", "hnorm.", "h_proj.", "e_proj.",
++                        "shared_head.", "hc_head_fn", "hc_head_base",
++                        "hc_head_scale")
++
++
++class SharedHead(nn.Module):
++
++    def __init__(self, config, prefix: str) -> None:
++        super().__init__()
++        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.head = ParallelLMHead(config.vocab_size,
++                                   config.hidden_size,
++                                   prefix=maybe_prefix(prefix, "head"))
++
++
++class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
++
++    def __init__(self, vllm_config: VllmConfig,
++                 topk_indices_buffer: torch.Tensor, prefix: str) -> None:
++        super().__init__()
++        config = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        self.config = config
++        self.hidden_size = config.hidden_size
++        self.rms_norm_eps = config.rms_norm_eps
++        self.hc_eps = config.hc_eps
++        self.hc_mult = config.hc_mult
++        self.hc_dim = self.hc_mult * config.hidden_size
++
++        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.e_proj = ReplicatedLinear(config.hidden_size,
++                                       config.hidden_size,
++                                       bias=False,
++                                       return_bias=False,
++                                       quant_config=quant_config,
++                                       prefix=f"{prefix}.e_proj")
++        self.h_proj = ReplicatedLinear(config.hidden_size,
++                                       config.hidden_size,
++                                       bias=False,
++                                       return_bias=False,
++                                       quant_config=quant_config,
++                                       prefix=f"{prefix}.h_proj")
++        self.hc_head_fn = nn.Parameter(torch.empty(self.hc_mult,
++                                                   self.hc_dim,
++                                                   dtype=torch.float32),
++                                       requires_grad=False)
++        self.hc_head_base = nn.Parameter(torch.empty(self.hc_mult,
++                                                     dtype=torch.float32),
++                                         requires_grad=False)
++        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32),
++                                          requires_grad=False)
++        self.shared_head = SharedHead(config, prefix)
++        # Same prefix as the GPU MTP: the block's attention registers its
++        # caches as ``model.layers.{43}.attn.*`` (no ``mtp_block`` segment).
++        self.mtp_block = DeepseekV4DecoderLayer(
++            vllm_config,
++            prefix,
++            topk_indices_buffer=topk_indices_buffer,
++            aux_stream_list=None,
++        )
++        self.hc_head_op = HCHeadOp()
++        self.mhc_post = MHCPostOp()
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        previous_hidden_states: torch.Tensor,
++        inputs_embeds: torch.Tensor,
++    ) -> torch.Tensor:
++        hidden = self.hidden_size
++        # Position 0 has no previous token for the MTP to condition on; the
++        # GPU kernel zeroes that embedding row before enorm.
++        inputs_embeds = torch.where(
++            positions.unsqueeze(-1) == 0,
++            torch.zeros_like(inputs_embeds),
++            inputs_embeds,
++        )
++        inputs_embeds = self.enorm(inputs_embeds)
++        # hnorm normalizes each of the hc_mult residual streams separately.
++        previous_hidden_states = self.hnorm(
++            previous_hidden_states.reshape(-1, hidden))
++        h = self.h_proj(previous_hidden_states).reshape(
++            -1, self.hc_mult, hidden)
++        e = self.e_proj(inputs_embeds)
++        hidden_states = h + e.unsqueeze(-2)
++
++        x, residual, post_mix, res_mix = self.mtp_block(
++            hidden_states, positions, input_ids)
++        if post_mix is not None:
++            x = self.mhc_post(x, residual, post_mix, res_mix)
++        # Pre-hc_head residual, flat [T, hc_mult * H]: the next spec step's
++        # ``previous_hidden_states``. hc_head is applied in compute_logits.
++        return x.flatten(1)
++
++    def pre_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        hidden_states = hidden_states.reshape(-1, self.hc_mult,
++                                              self.hidden_size)
++        hidden_states = self.hc_head_op(
++            hidden_states,
++            self.hc_head_fn,
++            self.hc_head_scale,
++            self.hc_head_base,
++            self.rms_norm_eps,
++            self.hc_eps,
++        )
++        return self.shared_head.norm(hidden_states)
++
++
++class DeepSeekV4MultiTokenPredictor(nn.Module):
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++        config = vllm_config.model_config.hf_config
++        self.config = config
++        self.mtp_start_layer_idx = config.num_hidden_layers
++        self.num_mtp_layers = config.num_nextn_predict_layers
++        self.topk_indices_buffer = torch.empty(
++            vllm_config.scheduler_config.max_num_batched_tokens,
++            config.index_topk,
++            dtype=torch.int32,
++        )
++        self.layers = nn.ModuleDict({
++            str(idx):
++            DeepSeekV4MultiTokenPredictorLayer(vllm_config,
++                                               self.topk_indices_buffer,
++                                               f"{prefix}.layers.{idx}")
++            for idx in range(self.mtp_start_layer_idx,
++                             self.mtp_start_layer_idx + self.num_mtp_layers)
++        })
++        # Shared with the target model at load time (see the DSV4 MTP
++        # proposer); the checkpoint has no MTP-specific embedding.
++        self.embed_tokens = VocabParallelEmbedding(
++            config.vocab_size,
++            config.hidden_size,
++            prefix=maybe_prefix(prefix, "embed_tokens"))
++        self.logits_processor = LogitsProcessor(config.vocab_size)
++
++    def _layer(self,
++               spec_step_idx: int) -> DeepSeekV4MultiTokenPredictorLayer:
++        idx = self.mtp_start_layer_idx + spec_step_idx % self.num_mtp_layers
++        return self.layers[str(idx)]
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        previous_hidden_states: torch.Tensor,
++        inputs_embeds: torch.Tensor | None = None,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor:
++        if inputs_embeds is None:
++            inputs_embeds = self.embed_tokens(input_ids)
++        return self._layer(spec_step_idx)(input_ids, positions,
++                                          previous_hidden_states,
++                                          inputs_embeds)
++
++    def compute_logits(self,
++                       hidden_states: torch.Tensor,
++                       spec_step_idx: int = 0) -> torch.Tensor:
++        layer = self._layer(spec_step_idx)
++        return self.logits_processor(layer.shared_head.head,
++                                     layer.pre_head(hidden_states))
++
++
++class DeepSeekV4MTP(nn.Module):
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++        self.config = vllm_config.model_config.hf_config
++        self.model = DeepSeekV4MultiTokenPredictor(vllm_config=vllm_config,
++                                                   prefix=maybe_prefix(
++                                                       prefix, "model"))
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.embed_tokens(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        intermediate_tensors=None,
++        inputs_embeds: torch.Tensor | None = None,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor:
++        return self.model(input_ids, positions, hidden_states, inputs_embeds,
++                          spec_step_idx)
++
++    def compute_logits(self,
++                       hidden_states: torch.Tensor,
++                       spec_step_idx: int = 0) -> torch.Tensor:
++        return self.model.compute_logits(hidden_states, spec_step_idx)
++
++    def checkpoint_name_to_param_name(self, name: str) -> str | None:
++        """Maps a checkpoint key to this module's parameter name, or None.
++
++        Only ``mtp.{i}.*`` keys belong to the draft. The embedding and LM head
++        are shared with the target and are not read from the checkpoint.
++        """
++        m = re.match(r"mtp\.(\d+)\.(.*)$", name)
++        if m is None:
++            return None
++        mtp_idx, rest = int(m.group(1)), m.group(2)
++        if mtp_idx >= self.model.num_mtp_layers:
++            return None
++        layer = self.model.mtp_start_layer_idx + mtp_idx
++        if rest.startswith(("norm.", "head.")):
++            rest = "shared_head." + rest
++        if not rest.startswith(_MTP_WRAPPER_WEIGHTS):
++            rest = "mtp_block." + rest
++        name = f"model.layers.{layer}.{rest}"
++        if name.endswith(".scale"):
++            if _EXPERT_SCALE_RE.search(name) and getattr(
++                    self.config, "expert_dtype", "fp4") == "fp4":
++                name = name[:-len(".scale")] + ".weight_scale"
++            else:
++                name = name[:-len(".scale")] + ".weight_scale_inv"
++        name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
++        if name.endswith(".ffn.gate.bias"):
++            name = name[:-len(".bias")] + ".e_score_correction_bias"
++        return name
++
++    def load_weights(self, weights: Iterable[tuple[str,
++                                                   torch.Tensor]]) -> set[str]:
++        stacked_params_mapping = [
++            # (param_name, shard_name, shard_id)
++            ("gate_up_proj", "w1", 0),
++            ("gate_up_proj", "w3", 1),
++            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
++            ("attn.fused_wqa_wkv", "attn.wkv", 1),
++        ]
++        params_dict = dict(self.named_parameters())
++        loaded_params: set[str] = set()
++
++        tp_size = get_tensor_model_parallel_world_size()
++        tp_rank = get_tensor_model_parallel_rank()
++        n_local_head = self.config.num_attention_heads // tp_size
++        head_rank_start = n_local_head * tp_rank
++        head_rank_end = n_local_head * (tp_rank + 1)
++
++        expert_mapping = fused_moe_make_expert_params_mapping(
++            self,
++            ckpt_gate_proj_name="w1",
++            ckpt_down_proj_name="w2",
++            ckpt_up_proj_name="w3",
++            num_experts=self.config.n_routed_experts,
++        )
++
++        for ckpt_name, loaded_weight in weights:
++            name = self.checkpoint_name_to_param_name(ckpt_name)
++            if name is None:
++                continue
++            for param_name, weight_name, shard_id in stacked_params_mapping:
++                if ".experts." in name or weight_name not in name:
++                    continue
++                name = name.replace(weight_name, param_name)
++                param = params_dict[name]
++                param.weight_loader(param, loaded_weight, shard_id)
++                loaded_params.add(name)
++                break
++            else:
++                if ".experts." in name:
++                    # E8M0 scales: keep the raw exponent bytes (see the
++                    # target loader).
++                    if ("weight_scale" in name
++                            and loaded_weight.dtype == torch.float8_e8m0fnu):
++                        loaded_weight = loaded_weight.view(torch.uint8)
++                    for (param_name, weight_name, expert_id,
++                         expert_shard_id) in expert_mapping:
++                        if weight_name not in name:
++                            continue
++                        name_mapped = name.replace(weight_name, param_name)
++                        if name_mapped not in params_dict:
++                            continue
++                        param = params_dict[name_mapped]
++                        weight_loader = typing.cast(Callable[..., bool],
++                                                    param.weight_loader)
++                        if weight_loader(param,
++                                         loaded_weight,
++                                         name_mapped,
++                                         shard_id=expert_shard_id,
++                                         expert_id=expert_id,
++                                         return_success=True):
++                            loaded_params.add(name_mapped)
++                            break
++                    else:
++                        raise KeyError(
++                            f"MTP expert weight {ckpt_name} -> {name} has no "
++                            "matching parameter")
++                    continue
++                param = params_dict[name]
++                if "attn_sink" in name:
++                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
++                    param[:narrow_weight.shape[0]].copy_(narrow_weight)
++                else:
++                    weight_loader = getattr(param, "weight_loader",
++                                            default_weight_loader)
++                    weight_loader(param, loaded_weight)
++                loaded_params.add(name)
++
++        if not loaded_params:
++            raise ValueError(
++                "DeepSeek V4 MTP: no mtp.* weights found in the checkpoint")
++        logger.info("DeepSeek V4 MTP draft loaded %d params",
++                    len(loaded_params))
++        return loaded_params
+diff --git a/tpu_inference/models/vllm/vllm_model_wrapper.py b/tpu_inference/models/vllm/vllm_model_wrapper.py
+index 2bd9463a8..e0ccaefde 100644
+--- a/tpu_inference/models/vllm/vllm_model_wrapper.py
++++ b/tpu_inference/models/vllm/vllm_model_wrapper.py
+@@ -48,7 +48,7 @@ from tpu_inference import envs
+ from tpu_inference.distributed.jax_parallel_state import \
+     get_pp_group as jax_get_pp_group
+ from tpu_inference.layers.common.attention_metadata import (
+-    AttentionMetadata, SharedAttentionMetadata)
++    AttentionMetadata, GroupedAttentionMetadata, SharedAttentionMetadata)
+ from tpu_inference.layers.common.sharding import ShardingAxisName
+ from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
+     shard_model_to_tpu
+@@ -418,6 +418,24 @@ class VllmModelWrapper:
+             else:
+                 if self.vllm_config.speculative_config and self.vllm_config.speculative_config.method == "eagle3":
+                     output, aux_hidden_states = jax_view(output_from_torch)
++                elif (self.vllm_config.speculative_config
++                      and self.vllm_config.speculative_config.method == "mtp"
++                      and isinstance(output_from_torch, tuple)):
++                    # Targets whose MTP draft needs a different hidden state
++                    # than the logits input (DeepSeek V4: the pre-hc_head
++                    # residual) return it as an aux hidden state.
++                    output, aux_hidden_states = jax_view(output_from_torch)
++                    # Token-sharded like the hidden states, so the drafter's
++                    # precompiled programs match the runtime input sharding.
++                    aux_hidden_states = [
++                        jax.lax.with_sharding_constraint(
++                            a,
++                            NamedSharding(
++                                self.mesh,
++                                PartitionSpec(ShardingAxisName.ATTN_DATA,
++                                              None)))
++                        for a in aux_hidden_states
++                    ]
+                 else:
+                     output = jax_view(output_from_torch)
+ 
+@@ -442,9 +460,14 @@ class VllmModelWrapper:
+         ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array],
+                    Optional[jax.Array]]:
+             layer_name_to_kvcache_index = dict(layer_name_to_kvcache_index)
++            # Per-layer (grouped) draft metadata: every group shares the
++            # token positions (DeepSeek V4 MTP).
++            positions = (attn_metadata.groups[0].input_positions
++                         if isinstance(attn_metadata, GroupedAttentionMetadata)
++                         else attn_metadata.input_positions)
+             # See step_fun_impl above: vLLM's set_forward_context requires
+             # num_tokens for the MoE sequence-parallel DP-metadata path.
+-            num_tokens = attn_metadata.input_positions.shape[-1]
++            num_tokens = positions.shape[-1]
+             with torchax.default_env(), set_vllm_model_wrapper_context(
+                     kv_caches=kv_caches,
+                     mesh=self.mesh,
+@@ -454,7 +477,7 @@ class VllmModelWrapper:
+                                    num_tokens=num_tokens):
+                 kwargs = {
+                     "input_ids": torch_view(input_ids),
+-                    "positions": torch_view(attn_metadata.input_positions),
++                    "positions": torch_view(positions),
+                     "hidden_states": torch_view(hidden_states),
+                     "inputs_embeds": None,
+                 }
+diff --git a/tpu_inference/runner/compilation_manager.py b/tpu_inference/runner/compilation_manager.py
+index 85ca489ee..91f4b69e9 100644
+--- a/tpu_inference/runner/compilation_manager.py
++++ b/tpu_inference/runner/compilation_manager.py
+@@ -42,6 +42,7 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
+ from tpu_inference.runner.decode_loop import TpuSamplingState, continue_decode
+ from tpu_inference.runner.pcp_utils import (pcp_page_order, pcp_seq_arrays,
+                                             pcp_token_layout)
++from tpu_inference.runner import utils as runner_utils
+ from tpu_inference.runner.utils import SpecDecodeMetadata
+ from tpu_inference.spec_decode.jax.utils import (
+     concat_last_sampled_tokens_and_draft_tokens, extend_logits_simple,
+@@ -1114,7 +1115,7 @@ class CompilationManager:
+                 "Compiling gather_logprobs for speculative decoding shapes.")
+             for num_logits in self.runner.num_logits_paddings:
+                 for num_reqs in self.runner.num_reqs_paddings:
+-                    if num_reqs > num_logits:
++                    if not self._spec_logits_reachable(num_logits, num_reqs):
+                         continue
+                     combined_size = num_logits + num_reqs
+                     logits_sharding = NamedSharding(self.runner.mesh,
+@@ -1183,14 +1184,30 @@ class CompilationManager:
+             "Compiling _process_and_extend_logits with different input shapes."
+         )
+         vocab_size = self.runner.vocab_size
++        # Only dispatched for processed logprobs under sampling (see
++        # _sample_from_logits); with the default raw logprobs it never runs.
++        if self.runner.model_config.logprobs_mode != "processed_logprobs":
++            logger.info("Skipping _process_and_extend_logits: logprobs_mode "
++                        "is %s.", self.runner.model_config.logprobs_mode)
++            return
++        attn_data_size = get_mesh_shape_product(self.runner.mesh,
++                                                ShardingAxisName.ATTN_DATA)
+         for num_logits in self.runner.num_logits_paddings:
+             for num_reqs in self.runner.num_reqs_paddings:
+-                if num_reqs > num_logits:
++                if not self._spec_logits_reachable(num_logits, num_reqs):
+                     continue
+ 
+-                logits_sharding = NamedSharding(self.runner.mesh,
+-                                                PartitionSpec())
+-                dp_sharding = NamedSharding(self.runner.mesh, PartitionSpec())
++                # Token-sharded like the runtime target/bonus logits. A
++                # replicated f32 [num_logits, vocab] dummy is ~2 GiB per chip
++                # at 4096 logits and exhausted HBM during precompile.
++                logits_sharding = NamedSharding(
++                    self.runner.mesh,
++                    PartitionSpec() if attn_data_size == 1 else PartitionSpec(
++                        ShardingAxisName.ATTN_DATA, None))
++                dp_sharding = NamedSharding(
++                    self.runner.mesh,
++                    PartitionSpec() if attn_data_size == 1 else PartitionSpec(
++                        ShardingAxisName.ATTN_DATA))
+ 
+                 target_logits = self._create_dummy_tensor(
+                     (num_logits, vocab_size), jnp.float32, logits_sharding)
+@@ -1251,7 +1268,7 @@ class CompilationManager:
+         vocab_size = self.runner.vocab_size
+         for num_logits in self.runner.num_logits_paddings:
+             for num_reqs in self.runner.num_reqs_paddings:
+-                if num_reqs > num_logits:
++                if not self._spec_logits_reachable(num_logits, num_reqs):
+                     continue
+ 
+                 attn_data_size = get_mesh_shape_product(
+@@ -1279,6 +1296,25 @@ class CompilationManager:
+                     num_reqs=num_reqs,
+                 )
+ 
++    def _spec_logits_reachable(self, num_logits: int, num_reqs: int) -> bool:
++        """Whether a (logits, requests) bucket pair can occur at runtime.
++
++        Per DP rank, the busiest rank holds more than the next-smaller request
++        bucket and each request samples 1..k+1 tokens, so its logits bucket is
++        at least the request bucket and at most the ladder bucket covering
++        reqs x (k + 1). Pairs outside that range are never dispatched; not
++        compiling them keeps their executables out of HBM.
++        """
++        dp = self.runner.dp_size
++        per_rank_logits = num_logits // dp
++        per_rank_reqs = max(num_reqs // dp, 1)
++        k = self.runner.speculative_config.num_speculative_tokens
++        upper = runner_utils.get_padded_token_len(
++            self.runner.num_logits_paddings_per_dp,
++            min(per_rank_reqs * (k + 1),
++                self.runner.num_logits_paddings_per_dp[-1]))
++        return num_reqs <= num_logits and per_rank_logits <= upper
++
+     def _precompile_speculative_decoding(self) -> None:
+         logger.info(
+             "Compiling speculative_decoding with different input shapes.")
+@@ -1293,7 +1329,106 @@ class CompilationManager:
+         elif self.runner.speculative_config.method == "dflash":
+             self._precompile_dflash_helpers()
+         elif self.runner.speculative_config.method == "mtp":
+-            self._precompile_mtp_helpers()
++            from tpu_inference.spec_decode.jax.dsv4_mtp import \
++                DeepseekV4MtpProposer
++            if isinstance(self.runner.drafter, DeepseekV4MtpProposer):
++                self._precompile_dsv4_mtp_helpers()
++            else:
++                self._precompile_mtp_helpers()
++
++    def _precompile_dsv4_mtp_helpers(self) -> None:
++        """Warm up the DeepSeek V4 MTP drafter (prepare_inputs + propose).
++
++        The drafter consumes the target's per-group (GroupedAttentionMetadata)
++        metadata and its pre-hc_head aux hidden state, so the generic MTP
++        warmup (single AttentionMetadata, hidden_size-wide states) does not
++        apply. Both calls run back to back per (tokens, reqs) bucket, as at
++        runtime; request_distribution is all zeros so no kernel body runs.
++        """
++        logger.info("Compiling DeepSeek V4 MTP drafter with different input "
++                    "shapes.")
++        runner = self.runner
++        drafter = runner.drafter
++        mesh = runner.mesh
++        hf_config = runner.model_config.hf_config
++        mtp_hidden = hf_config.hidden_size * hf_config.hc_mult
++        dp_size = runner.dp_size
++        dp_sharding = NamedSharding(mesh,
++                                    PartitionSpec(ShardingAxisName.ATTN_DATA))
++        metadata_sharding = NamedSharding(
++            mesh, PartitionSpec(ShardingAxisName.BATCH))
++        hidden_sharding = NamedSharding(
++            mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
++        attn_seqs = runner.attn_max_num_seqs
++
++        def zeros(shape, sharding):
++            return device_array(mesh,
++                                np.zeros(shape, dtype=np.int32),
++                                sharding=sharding)
++
++        seq_lens = zeros((attn_seqs, ), metadata_sharding)
++        query_start_loc = zeros((attn_seqs + dp_size, ), metadata_sharding)
++        request_distribution = zeros((3 * dp_size, ), metadata_sharding)
++        groups = runner.kv_cache_config.kv_cache_groups
++        block_tables = []
++        for gid in range(len(groups)):
++            bt = runner.input_batch.block_table[gid]
++            block_tables.append(
++                zeros((runner.max_num_reqs * bt.max_num_blocks_per_req, ),
++                      metadata_sharding))
++        last_sampled_token_id = zeros((runner.max_num_reqs, ), dp_sharding)
++        num_rejected_tokens = zeros((runner.max_num_reqs, ), dp_sharding)
++        next_prompt_token_id = zeros((attn_seqs, ), dp_sharding)
++        is_in_prefill = zeros((attn_seqs, ), dp_sharding)
++        num_reqs_dp = zeros((dp_size, ), dp_sharding)
++
++        for num_tokens in runner.num_tokens_paddings:
++            for num_reqs in runner.attn_num_reqs_paddings:
++                positions = zeros((num_tokens, ), dp_sharding)
++                input_ids = zeros((num_tokens, ), metadata_sharding)
++                attention_metadata = GroupedAttentionMetadata(
++                    groups=tuple(
++                        AttentionMetadata(
++                            input_positions=positions,
++                            block_tables=block_tables[gid],
++                            seq_lens=seq_lens,
++                            query_start_loc=query_start_loc,
++                            request_distribution=request_distribution,
++                            padded_num_reqs=num_reqs,
++                        ) for gid in range(len(groups))),
++                    layer_names_per_group=tuple(
++                        tuple(group.layer_names) for group in groups),
++                )
++                aux_hidden_states = (self._create_dummy_tensor(
++                    (num_tokens, mtp_hidden), jnp.bfloat16,
++                    hidden_sharding), )
++
++                def drafter_warmup(_fn, _args, _call_kwargs):
++                    (target_hidden_states, draft_input_ids,
++                     last_token_indices,
++                     draft_metadata) = drafter.prepare_inputs(*_args)
++                    kv_caches, draft_token_ids = drafter.propose(
++                        runner.kv_caches, draft_input_ids, draft_metadata,
++                        last_token_indices, target_hidden_states)
++                    runner.kv_caches = kv_caches
++                    return draft_token_ids
++
++                self._run_compilation(
++                    "dsv4_mtp_drafter",
++                    drafter.prepare_inputs,
++                    attention_metadata,
++                    input_ids,
++                    aux_hidden_states,
++                    last_sampled_token_id,
++                    next_prompt_token_id,
++                    is_in_prefill,
++                    num_rejected_tokens,
++                    num_reqs_dp,
++                    num_tokens=num_tokens,
++                    num_reqs=num_reqs,
++                    warmup_handler=drafter_warmup,
++                    aot=False,
++                )
+ 
+     def _precompile_select_from_array_spec_decode(self) -> None:
+         logger.info("Compiling select_from_array with different input shapes.")
+@@ -1305,6 +1440,8 @@ class CompilationManager:
+ 
+         for num_logits in self.runner.num_logits_paddings:
+             for num_reqs in self.runner.num_reqs_paddings:
++                if not self._spec_logits_reachable(num_logits, num_reqs):
++                    continue
+                 # Case 1: Select bonus logits (indices shape (num_reqs, ))
+                 array = self._create_dummy_tensor(
+                     (num_logits, vocab_size), self.runner.model_config.dtype,
+@@ -1388,6 +1525,8 @@ class CompilationManager:
+         # bonus_tokens (num_reqs)].
+         for num_logits in self.runner.num_logits_paddings:
+             for num_reqs in self.runner.num_reqs_paddings:
++                if not self._spec_logits_reachable(num_logits, num_reqs):
++                    continue
+                 sampled_token_ids = self._create_dummy_tensor(
+                     (num_logits + num_reqs, ),
+                     jnp.int32,
+@@ -1428,6 +1567,8 @@ class CompilationManager:
+         vocab_size = self.runner.vocab_size
+         for num_logits in self.runner.num_logits_paddings:
+             for num_reqs in self.runner.num_reqs_paddings:
++                if not self._spec_logits_reachable(num_logits, num_reqs):
++                    continue
+                 sharding = NamedSharding(
+                     self.runner.mesh,
+                     PartitionSpec(ShardingAxisName.MLP_DATA,
+diff --git a/tpu_inference/runner/speculative_decoding_manager.py b/tpu_inference/runner/speculative_decoding_manager.py
+index ec7766708..b853b7334 100644
+--- a/tpu_inference/runner/speculative_decoding_manager.py
++++ b/tpu_inference/runner/speculative_decoding_manager.py
+@@ -189,7 +189,8 @@ class SpeculativeDecodingManager:
+         next_prompt_token_id, is_in_prefill, num_reqs_dp = device_array(
+             self.runner.mesh,
+             (next_prompt_token_id, is_in_prefill, num_reqs_dp),
+-            sharding=(PartitionSpec(ShardingAxisName.ATTN_DATA)))
++            sharding=NamedSharding(self.runner.mesh,
++                                   PartitionSpec(ShardingAxisName.ATTN_DATA)))
+ 
+         aux_hidden_states_for_drafter = aux_hidden_states
+ 
+@@ -237,6 +238,12 @@ class SpeculativeDecodingManager:
+         hidden_states: jnp.ndarray,
+     ) -> list[list[int]] | jnp.ndarray:
+         assert isinstance(self.runner.drafter, Eagle3Proposer)
++        # The DeepSeek V4 MTP drafter selects its own KV-cache group from the
++        # full per-layer metadata; collapsing it here would hand it another
++        # group's block tables.
++        drafter_attn_metadata = (attn_metadata if getattr(
++            self.runner.drafter, "uses_grouped_attention_metadata", False)
++                                 else None)
+         if isinstance(attn_metadata, dict):
+             # When multiple KV cache groups are used (e.g., in hybrid models),
+             # attn_metadata becomes a dict mapping layer names to AttentionMetadata.
+@@ -282,15 +289,21 @@ class SpeculativeDecodingManager:
+         next_prompt_token_id, is_in_prefill, num_reqs_dp = device_array(
+             self.runner.mesh,
+             (next_prompt_token_id, is_in_prefill, num_reqs_dp),
+-            sharding=(PartitionSpec(ShardingAxisName.ATTN_DATA)))
++            sharding=NamedSharding(self.runner.mesh,
++                                   PartitionSpec(ShardingAxisName.ATTN_DATA)))
+ 
+         if self.runner.speculative_config.method == "mtp":
+-            aux_hidden_states_for_drafter = (hidden_states, )
++            # Targets that return a dedicated MTP hidden state (DeepSeek V4:
++            # the pre-hc_head residual) hand it over as aux hidden states.
++            aux_hidden_states_for_drafter = (tuple(aux_hidden_states)
++                                             if aux_hidden_states else
++                                             (hidden_states, ))
+         else:
+             aux_hidden_states_for_drafter = aux_hidden_states
+ 
+         target_hidden_states, input_ids, last_token_indices, attn_metadata = self.runner.drafter.prepare_inputs(
+-            attn_metadata,
++            drafter_attn_metadata
++            if drafter_attn_metadata is not None else attn_metadata,
+             input_ids,
+             aux_hidden_states_for_drafter,
+             last_sampled_token_id,
+@@ -413,6 +426,9 @@ class SpeculativeDecodingManager:
+         padded_bonus_logits_indices = np.concatenate(out_bonus_logits_indices)
+         padded_num_draft_tokens = np.concatenate(out_draft_lengths)
+         padded_num_draft_tokens_cpu = padded_num_draft_tokens
++        # Host copy for the runner's logits-index buffer: the device copy is
++        # sharded across all hosts and cannot be read back on multi-host.
++        padded_logits_indices_cpu = padded_logits_indices
+         # CPU -> TPU copy.
+         (padded_num_draft_tokens, padded_logits_indices,
+          padded_target_logits_indices,
+@@ -430,6 +446,7 @@ class SpeculativeDecodingManager:
+             final_logits_indices=padded_logits_indices,
+         )
+         metadata.draft_lengths_cpu = padded_num_draft_tokens_cpu
++        metadata.final_logits_indices_cpu = padded_logits_indices_cpu
+         metadata.req_indices_dp = req_indices_dp
+         metadata.req_ids_dp = req_ids_dp
+         return metadata
+diff --git a/tpu_inference/runner/tpu_runner.py b/tpu_inference/runner/tpu_runner.py
+index ac4746809..0794b4cba 100644
+--- a/tpu_inference/runner/tpu_runner.py
++++ b/tpu_inference/runner/tpu_runner.py
+@@ -651,8 +651,10 @@ def _jax_logprobs_materialize(
+     # rejected ones) and bonus tokens. We filter them to only keep the accepted
+     # draft tokens and the actual bonus token for each request, and flatten them
+     # back to match the output format.
+-    if (spec_decode_metadata is not None
+-            and np.sum(spec_decode_metadata.draft_lengths_cpu) > 0):
++    # The layout is the rejection sampler's ([main | bonus] per DP rank)
++    # whenever spec metadata exists, also for steps without any draft tokens
++    # (e.g. the token sampled at the end of a prefill).
++    if spec_decode_metadata is not None:
+         assert runner is not None
+         vocab_size = runner.input_batch.vocab_size
+         dp_size = runner.dp_size
+@@ -863,11 +865,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+         """Generative model or pooling model select different computations."""
+         self.enable_continue_decode = self.vllm_config.additional_config.get(
+             "enable_continue_decode", False)
++        # Speculative decoding keeps every host-side read of async results on
++        # the replicated `next_tokens` copy (rejection-sampler output) or on
++        # host metadata; draft tokens stay on device (`spec_decode_next_tokens`)
++        # and the async scheduler never asks the workers for them.
+         if (os.environ.get("TPU_ASYNC_REPLICATE_OUTPUTS", "0") == "1"
+                 and self.scheduler_config.async_scheduling
+-                and (self.enable_continue_decode or self.speculative_config)):
++                and self.enable_continue_decode):
+             raise ValueError("H4 replicated async output is validated only without "
+-                             "continue_decode or speculative decoding")
++                             "continue_decode")
+         # continue_decode EOS-check interval: how often the fused decode loop
+         # observes the any-sequence-hit-EOS early exit (see decode_loop.py). Set
+         # via the CONTINUE_DECODE_EOS_CHECK_INTERVAL env var so it can be retuned
+@@ -1069,6 +1075,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+                 self.drafter = NgramProposer(self.vllm_config)
+             elif self.speculative_config.method == "dflash":
+                 self.drafter = DFlashProposer(self.vllm_config, self)
++            elif (self.speculative_config.method == "mtp"
++                  and "DeepseekV4ForCausalLM"
++                  in self.model_config.architectures):
++                from tpu_inference.spec_decode.jax.dsv4_mtp import \
++                    DeepseekV4MtpProposer
++                self.drafter = DeepseekV4MtpProposer(self.vllm_config, self)
+             elif self.speculative_config.use_eagle():
+                 self.drafter = Eagle3Proposer(self.vllm_config, self)
+             else:
+@@ -1218,12 +1230,30 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+         max_logits_per_req = 1
+         if self.speculative_config:
+             max_logits_per_req = self.speculative_config.num_speculative_tokens + 1  # Including bonus token
+-            self.num_logits_paddings = runner_utils.get_token_paddings(
+-                min_token_size=MIN_NUM_SEQS,
+-                max_token_size=self.max_num_reqs * max_logits_per_req,
+-                padding_gap=0)
++            if self.dp_size > 1:
++                # Logits rows are padded per attention-DP rank and the global
++                # logits array is `per_rank * dp_size`, so the ladder is built
++                # per rank (from k + 1 rows, one decode request) and scaled;
++                # the precompiled global shapes then equal the runtime ones.
++                per_rank_max = (self.max_num_reqs //
++                                self.dp_size) * max_logits_per_req
++                self.num_logits_paddings_per_dp = (
++                    runner_utils.get_token_paddings(
++                        min_token_size=next_power_of_2(max_logits_per_req),
++                        max_token_size=per_rank_max,
++                        padding_gap=0))
++                self.num_logits_paddings = [
++                    p * self.dp_size for p in self.num_logits_paddings_per_dp
++                ]
++            else:
++                self.num_logits_paddings = runner_utils.get_token_paddings(
++                    min_token_size=MIN_NUM_SEQS,
++                    max_token_size=self.max_num_reqs * max_logits_per_req,
++                    padding_gap=0)
++                self.num_logits_paddings_per_dp = self.num_logits_paddings
+         else:
+             self.num_logits_paddings = None
++            self.num_logits_paddings_per_dp = None
+ 
+         # tensors for structured decoding
+         self.grammar_bitmask_cpu = np.zeros(
+@@ -1729,9 +1759,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+             raise ValueError(
+                 "prompt_logprobs is not supported for multimodal models.")
+ 
+-        if self.speculative_config and self.input_batch.num_prompt_logprobs:
+-            raise ValueError(
+-                "prompt_logprobs is not supported with speculative decoding.")
++        # Prompt logprobs come from `full_logits` over the scheduled prompt
++        # chunk of a prefilling request, which never carries draft tokens, so
++        # they are computed exactly as without speculative decoding.
+ 
+         # NOTE(Wenlong): For multi-modal model,
+         # it will embed the text tokens and merge with the existing modality embeds
+@@ -2874,12 +2904,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+                 total_sampled_tokens = np.sum(num_sampled_tokens)
+                 if padded_logits_length is None:
+                     padded_logits_length = runner_utils.get_padded_token_len(
+-                        self.num_logits_paddings, total_sampled_tokens)
++                        self.num_logits_paddings_per_dp, total_sampled_tokens)
+                 else:
+                     padded_logits_length = max(
+                         padded_logits_length,
+                         runner_utils.get_padded_token_len(
+-                            self.num_logits_paddings, total_sampled_tokens))
++                            self.num_logits_paddings_per_dp,
++                            total_sampled_tokens))
+ 
+             assert padded_logits_length is not None
+             logits_indices_shape = (padded_logits_length * dp_size, )
+@@ -3047,7 +3078,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+                                                   dp_size),
+                     max_num_reqs_per_dp_rank=max_num_reqs_per_dp_rank,
+                 ))
+-            logits_indices_view[:] = spec_decode_metadata.final_logits_indices
++            logits_indices_view[:] = spec_decode_metadata.final_logits_indices_cpu
+ 
+         # Put to device
+         sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
+diff --git a/tpu_inference/runner/utils.py b/tpu_inference/runner/utils.py
+index 0a4f880c0..b04dc7069 100644
+--- a/tpu_inference/runner/utils.py
++++ b/tpu_inference/runner/utils.py
+@@ -951,6 +951,8 @@ class SpecDecodeMetadata:
+     final_logits_indices: jnp.ndarray
+ 
+     draft_lengths_cpu: Any = field(init=False, default=None)
++    # Host copy of final_logits_indices (the device copy spans all hosts).
++    final_logits_indices_cpu: Any = field(init=False, default=None)
+     req_indices_dp: dict = field(init=False, default_factory=dict)
+     req_ids_dp: dict = field(init=False, default_factory=dict)
+ 
+diff --git a/tpu_inference/spec_decode/jax/dsv4_mtp.py b/tpu_inference/spec_decode/jax/dsv4_mtp.py
+new file mode 100644
+index 000000000..dfe1a818d
+--- /dev/null
++++ b/tpu_inference/spec_decode/jax/dsv4_mtp.py
+@@ -0,0 +1,255 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""MTP proposer for DeepSeek V4 (vLLM/torchax model implementation).
++
++Reuses the Eagle3Proposer algorithm (method ``mtp``) with three DSV4-specific
++differences:
++
++* DSV4 attention reads per-layer metadata from a ``GroupedAttentionMetadata``
++  (one entry per KV-cache group). The MTP layer's sliding-window cache lives in
++  whichever group vLLM put it in, not necessarily the last one, so the draft
++  metadata is derived from that group's entry of the target metadata. That
++  entry's block table is already in the attention-DP rank order the kernels
++  expect (the input-batch CPU table is not).
++* The draft conditions on the target's pre-hc_head residual
++  ``[T, hc_mult * hidden]``, which the DSV4 target returns as its aux hidden
++  state.
++* The draft has no embedding / LM head of its own; both are shared with the
++  target.
++"""
++from dataclasses import replace
++from typing import Any
++
++import jax
++import jax.numpy as jnp
++from flax import nnx
++
++from tpu_inference.layers.common.attention_metadata import (
++    AttentionMetadata, GroupedAttentionMetadata)
++from tpu_inference.logger import init_logger
++from tpu_inference.models.common.model_loader import get_model
++from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
++
++logger = init_logger(__name__)
++
++TARGET_EMBED = "vllm_model.model.embed_tokens.weight"
++TARGET_LM_HEAD = "vllm_model.lm_head.weight"
++
++
++def mtp_layer_prefixes(hf_config) -> tuple[str, ...]:
++    start = hf_config.num_hidden_layers
++    n = getattr(hf_config, "num_nextn_predict_layers", 1) or 1
++    return tuple(f"model.layers.{start + i}." for i in range(n))
++
++
++def find_draft_kv_cache_group(kv_cache_groups,
++                              hf_config) -> tuple[int, tuple[str, ...]]:
++    """Returns (group id, MTP layer names) of the KV-cache group holding the
++    MTP layers. All MTP caches must share one group (they are all SWA)."""
++    prefixes = mtp_layer_prefixes(hf_config)
++    found: dict[int, list[str]] = {}
++    for gid, group in enumerate(kv_cache_groups):
++        for name in group.layer_names:
++            if name.startswith(prefixes):
++                found.setdefault(gid, []).append(name)
++    if len(found) != 1:
++        raise ValueError(
++            "DeepSeek V4 MTP: expected the MTP layers' KV caches in exactly "
++            f"one KV-cache group, found {found} (prefixes {prefixes})")
++    gid, names = next(iter(found.items()))
++    return gid, tuple(names)
++
++
++class DeepseekV4MtpProposer(Eagle3Proposer):
++
++    # SpeculativeDecodingManager passes the full GroupedAttentionMetadata.
++    uses_grouped_attention_metadata = True
++
++    def __init__(self, vllm_config, runner: Any):
++        super().__init__(vllm_config, runner)
++        assert self.method == "mtp"
++        self._draft_gid: int | None = None
++        self._draft_layer_names: tuple[str, ...] | None = None
++
++    # ------------------------------------------------------------------ load
++    def load_model(self, target_model: Any) -> None:
++        state = self.runner.state
++        missing = [k for k in (TARGET_EMBED, TARGET_LM_HEAD) if k not in state]
++        if missing:
++            raise ValueError(
++                f"DeepSeek V4 MTP: target params {missing} not found")
++        shared_params = {"vllm_model.model.embed_tokens.weight": state[TARGET_EMBED]}
++        for prefix in mtp_layer_prefixes(
++                self.draft_model_config.hf_config):
++            shared_params[
++                f"vllm_model.{prefix}shared_head.head.weight"] = state[
++                    TARGET_LM_HEAD]
++
++        model = get_model(
++            self.vllm_config,
++            self.rng_key,
++            self.mesh,
++            is_draft_model=True,
++            shared_params=shared_params,
++        )
++        self.model_fn = model.model_fn
++        self.compute_logits_fn = model.compute_logits_fn
++        self.pooler_fn = model.pooler_fn
++        self.combine_hidden_states_fn = model.combine_hidden_states_fn
++        self.state = model.state
++        self.state_leaves = model.state_leaves
++        self.model = model.model
++        if isinstance(self.state, nnx.State):
++            self.state_leaves = tuple(jax.tree_util.tree_leaves(self.state))
++        else:
++            self.state_leaves = self.state
++
++    # ------------------------------------------------------------ metadata
++    def _resolve_draft_group(self) -> None:
++        if self._draft_gid is None:
++            self._draft_gid, self._draft_layer_names = (
++                find_draft_kv_cache_group(
++                    self.runner.kv_cache_config.kv_cache_groups,
++                    self.draft_model_config.hf_config))
++            logger.info("DeepSeek V4 MTP: draft KV-cache group %d, layers %s",
++                        self._draft_gid, self._draft_layer_names)
++
++    def _group(self, attn_metadata: AttentionMetadata
++               ) -> GroupedAttentionMetadata:
++        return GroupedAttentionMetadata(
++            groups=(attn_metadata, ),
++            layer_names_per_group=(self._draft_layer_names, ))
++
++    def prepare_inputs(
++        self,
++        attn_metadata: GroupedAttentionMetadata,
++        input_ids: jax.Array,
++        aux_hidden_states: tuple[jax.Array, ...],
++        last_sampled_token_id: jax.Array,
++        next_prompt_token_id: jax.Array,
++        is_in_prefill: jax.Array,
++        num_rejected_tokens: jax.Array,
++        num_reqs_dp: jax.Array,
++    ) -> tuple[jax.Array, jax.Array, jax.Array, AttentionMetadata]:
++        assert aux_hidden_states is not None and len(aux_hidden_states) > 0, (
++            "DeepSeek V4 MTP needs the target's pre-hc_head hidden states")
++        self._resolve_draft_group()
++        if not isinstance(attn_metadata, GroupedAttentionMetadata):
++            raise TypeError(
++                "DeepSeek V4 MTP needs the per-group target metadata, got "
++                f"{type(attn_metadata).__name__}")
++        base = attn_metadata.groups[self._draft_gid]
++        return self._prepare_inputs(
++            state_leaves=self.state_leaves,
++            num_reqs=num_reqs_dp,
++            block_tables=base.block_tables,
++            attn_metadata=base,
++            input_ids=input_ids,
++            aux_hidden_states=tuple(aux_hidden_states),
++            last_sampled_token_id=last_sampled_token_id,
++            next_prompt_token_id=next_prompt_token_id,
++            is_in_prefill=is_in_prefill,
++            num_rejected_tokens=num_rejected_tokens)
++
++    # -------------------------------------------------------------- propose
++    def propose(
++        self,
++        kv_caches: list[jax.Array],
++        input_ids: jax.Array,
++        attn_metadata: AttentionMetadata,
++        last_token_indices,
++        target_hidden_states,
++    ) -> tuple[list[jax.Array], jnp.ndarray]:
++        self._resolve_draft_group()
++        return self._propose_dsv4(
++            state_leaves=self.state_leaves,
++            kv_caches=kv_caches,
++            input_ids=input_ids,
++            attn_metadata=attn_metadata,
++            last_token_indices=last_token_indices,
++            target_hidden_states=target_hidden_states,
++            num_speculative_tokens=self.num_speculative_tokens,
++            layer_name_to_kvcache_index=tuple(
++                self.runner.layer_name_to_kvcache_index.items()))
++
++    @jax.jit(
++        donate_argnames=("kv_caches", ),
++        out_shardings=(None, None),
++        compiler_options={
++            "xla_tpu_all_gather_collective_matmul_mode":
++            "post_spmd_conservative",
++            "xla_tpu_reduce_scatter_collective_matmul_mode":
++            "post_spmd_conservative"
++        },
++        static_argnums=(0, 7, 8),
++    )
++    def _propose_dsv4(
++        self,
++        state_leaves: Any,
++        kv_caches: list[jax.Array],
++        input_ids: jax.Array,
++        attn_metadata: AttentionMetadata,
++        last_token_indices,
++        target_hidden_states,
++        num_speculative_tokens: int,
++        layer_name_to_kvcache_index: tuple,
++    ) -> tuple[list[jax.Array], jnp.ndarray]:
++        """Eagle3Proposer._propose with DSV4 grouped draft metadata.
++
++        Step 0 runs the MTP layer over the accepted target tokens (writing its
++        SWA cache at their positions) and drafts from the last one; steps
++        1..k-1 feed back one draft token per request at position + 1.
++        """
++        kv_caches, hidden_states, residual, _ = self.model_fn(
++            state_leaves,
++            kv_caches,
++            input_ids,
++            target_hidden_states,
++            self._group(attn_metadata),
++            layer_name_to_kvcache_index,
++            spec_step_idx=0,
++        )
++        if num_speculative_tokens == 1:
++            return kv_caches, self._select_draft_token_ids(
++                state_leaves, hidden_states, last_token_indices)
++
++        positions, hidden_states, draft_token_ids = (
++            self._select_inputs_for_loop_speculation(
++                state_leaves, attn_metadata.input_positions, residual[0],
++                hidden_states, last_token_indices))
++        draft_token_ids_list = [draft_token_ids]
++        for i in range(num_speculative_tokens - 1):
++            (positions, clamped_positions, new_seq_lens, query_start_loc,
++             new_block_tables) = self._update_inputs_for_loop_speculation(
++                 positions, attn_metadata.seq_lens, attn_metadata.block_tables)
++            attn_metadata = replace(
++                attn_metadata,
++                input_positions=clamped_positions,
++                seq_lens=new_seq_lens,
++                query_start_loc=query_start_loc,
++                block_tables=new_block_tables,
++            )
++            kv_caches, new_hidden_states, residual, _ = self.model_fn(
++                state_leaves,
++                kv_caches,
++                draft_token_ids_list[-1],
++                hidden_states,
++                self._group(attn_metadata),
++                layer_name_to_kvcache_index,
++                spec_step_idx=i + 1,
++            )
++            hidden_states = residual[0]
++            draft_token_ids_list.append(
++                self._get_draft_token_ids(state_leaves, new_hidden_states))
++        return kv_caches, self._stack_draft_token_ids(draft_token_ids_list)
+diff --git a/tpu_inference/spec_decode/jax/eagle3.py b/tpu_inference/spec_decode/jax/eagle3.py
+index 196b684b1..9b52e0c31 100644
+--- a/tpu_inference/spec_decode/jax/eagle3.py
++++ b/tpu_inference/spec_decode/jax/eagle3.py
+@@ -338,8 +338,10 @@ class Eagle3Proposer:
+             draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+         block_tables = device_array(self.mesh,
+                                     block_tables,
+-                                    sharding=PartitionSpec(
+-                                        ShardingAxisName.ATTN_DATA))
++                                    sharding=NamedSharding(
++                                        self.mesh,
++                                        PartitionSpec(
++                                            ShardingAxisName.ATTN_DATA)))
+         num_reqs = num_reqs_dp
+         return self._prepare_inputs(
+             state_leaves=self.state_leaves,

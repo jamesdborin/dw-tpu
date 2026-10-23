@@ -1,0 +1,370 @@
+From fd00f1c73a9af198e9fe4c506becbe8645d67858 Mon Sep 17 00:00:00 2001
+From: dsv4-moe-overlap <w@x>
+Date: Tue, 20 Oct 2026 16:56:12 +0100
+Subject: [PATCH 102/108] One-shot Pallas all-gather / reduce-scatter for MoE
+ decode (MOE_ONESHOT_GATHER, MOE_ONESHOT_SCATTER)
+
+---
+ tpu_inference/envs.py                        |  17 ++
+ tpu_inference/kernels/collectives/oneshot.py | 185 +++++++++++++++++++
+ tpu_inference/layers/common/fused_moe_gmm.py |  49 ++++-
+ 3 files changed, 244 insertions(+), 7 deletions(-)
+ create mode 100644 tpu_inference/kernels/collectives/oneshot.py
+
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index 371607ba8..f1f274173 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -88,6 +88,9 @@ if TYPE_CHECKING:
+     MOE_HIERARCHICAL_DISPATCH: bool = False
+     MOE_PACKED_ROUTE_GATHER: bool = False
+     MOE_PACKED_ROUTE_GATHER_MAX_TOKENS: int = 512
++    MOE_ONESHOT_GATHER: bool = False
++    MOE_ONESHOT_SCATTER: bool = False
++    MOE_ONESHOT_MAX_TOKENS: int = 512
+     MOE_HIERARCHICAL_COLLECT: bool = False
+     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
+     RAGGED_GATHER_TRIM_ROWS: bool = True
+@@ -559,6 +562,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # gather is negligible and the packed copy adds a full hidden-size temp.
+     "MOE_PACKED_ROUTE_GATHER_MAX_TOKENS":
+     lambda: int(os.getenv("MOE_PACKED_ROUTE_GATHER_MAX_TOKENS") or "512"),
++    # Run the packed (MOE_PACKED_ROUTE_GATHER) dispatch all-gather as a one-shot
++    # Pallas kernel (kernels/collectives/oneshot.py): one remote DMA per peer
++    # instead of XLA's ring. Pure data movement: bit-identical.
++    "MOE_ONESHOT_GATHER":
++    env_bool("MOE_ONESHOT_GATHER", default=False),
++    # Run the GMM-TP + attention-DP output reduce-scatter as a one-shot Pallas
++    # kernel; the peer blocks are summed in f32 in fixed rank order.
++    # Reduction order differs from XLA's collective.
++    "MOE_ONESHOT_SCATTER":
++    env_bool("MOE_ONESHOT_SCATTER", default=False),
++    # Largest global token count (MoE input rows) that takes the one-shot
++    # kernels; larger (prefill) buckets keep XLA's collectives.
++    "MOE_ONESHOT_MAX_TOKENS":
++    lambda: int(os.getenv("MOE_ONESHOT_MAX_TOKENS") or "512"),
+     # The reverse for the EP collect: each chip's two cores add column halves
+     # on-chip, then reduce-scatter half the columns over the attention-data
+     # axes. Same mesh and hidden-size conditions as MOE_HIERARCHICAL_DISPATCH.
+diff --git a/tpu_inference/kernels/collectives/oneshot.py b/tpu_inference/kernels/collectives/oneshot.py
+new file mode 100644
+index 000000000..714f5322d
+--- /dev/null
++++ b/tpu_inference/kernels/collectives/oneshot.py
+@@ -0,0 +1,185 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""One-shot all-gather and reduce-scatter for small (decode-sized) arrays.
++
++XLA's TPU collectives step around a ring, so a 32-way all-gather of a few KB
++costs ~31 hop latencies (~30-45 us measured on v6e 4x8) although the bytes
++would cross ICI in a few us. Here every device writes its block straight into
++every peer with one remote DMA each (ICI routes multi-hop), after one barrier.
++
++Must be called inside a shard_map whose mesh has every axis manual; ``axes``
++are the mesh axes the collective runs over (first axis major, like
++jax.lax.all_gather over a tuple of axes). All other mesh axes keep their
++own coordinate.
++
++* all_gather_local: pure data movement, bit-identical to jax.lax.all_gather
++  (tiled, axis 0).
++* reduce_scatter_local: each device receives every peer's block for its rows
++  and sums the n blocks in f32 in fixed rank order 0..n-1, then casts. Same
++  result as psum_scatter up to summation order (and with f32 accumulation).
++"""
++
++import functools
++
++import jax
++import jax.numpy as jnp
++from jax import lax
++from jax.experimental import pallas as pl
++from jax.experimental.pallas import tpu as pltpu
++
++# Interpret-mode params for CPU tests (None = compile for TPU).
++INTERPRET = None
++
++
++def _axes_info(axes: tuple[str, ...]):
++    sizes = tuple(lax.axis_size(a) for a in axes)
++    n = 1
++    for s in sizes:
++        n *= s
++    return sizes, n
++
++
++def _my_rank(axes, sizes):
++    r = 0
++    for a, s in zip(axes, sizes):
++        r = r * s + lax.axis_index(a)
++    return r
++
++
++def _device_id(rank, axes, sizes, mesh_axes):
++    """MESH device id of the peer at linear ``rank`` along ``axes``."""
++    coord = {}
++    for a, s in reversed(list(zip(axes, sizes))):
++        coord[a] = rank % s
++        rank = rank // s
++    return tuple(coord[a] if a in coord else lax.axis_index(a)
++                 for a in mesh_axes)
++
++
++def _barrier(n, me, dev):
++    sem = pltpu.get_barrier_semaphore()
++    for k in range(n):
++        pl.semaphore_signal(sem,
++                            1,
++                            device_id=dev(lax.rem(me + k, n)),
++                            device_id_type=pl.DeviceIdType.MESH)
++    pl.semaphore_wait(sem, n)
++
++
++def _push_all(n, me, dev, src_of, dst_of, local_sem, send_sem, recv_sem):
++    """Copy src_of(t) into dst_of(me) on every device t (self by local DMA)."""
++    local = pltpu.make_async_copy(src_of(me), dst_of(me), local_sem)
++    local.start()
++    copies = []
++    # Rotate targets so devices do not all hit the same peer first.
++    for k in range(1, n):
++        t = lax.rem(me + k, n)
++        c = pltpu.make_async_remote_copy(src_ref=src_of(t),
++                                         dst_ref=dst_of(me),
++                                         send_sem=send_sem,
++                                         recv_sem=recv_sem,
++                                         device_id=dev(t),
++                                         device_id_type=pl.DeviceIdType.MESH)
++        c.start()
++        copies.append(c)
++    local.wait()
++    for c in copies:
++        c.wait_send()
++    # Every incoming copy has the same size as our outgoing ones.
++    for c in copies:
++        c.wait_recv()
++
++
++def _ag_kernel(x_ref, o_ref, local_sem, send_sem, recv_sem, *, axes, sizes, n,
++               rows, mesh_axes):
++    me = _my_rank(axes, sizes)
++    dev = functools.partial(_device_id,
++                            axes=axes,
++                            sizes=sizes,
++                            mesh_axes=mesh_axes)
++    _barrier(n, me, dev)
++    _push_all(n, me, dev, lambda t: x_ref, lambda s: o_ref.at[s], local_sem,
++              send_sem, recv_sem)
++
++
++def _rs_kernel(x_ref, o_ref, local_sem, send_sem, recv_sem, *, axes, sizes, n,
++               rows, mesh_axes):
++    me = _my_rank(axes, sizes)
++    dev = functools.partial(_device_id,
++                            axes=axes,
++                            sizes=sizes,
++                            mesh_axes=mesh_axes)
++    _barrier(n, me, dev)
++    # Block t of our partial sums goes to device t, into its slot `me`.
++    _push_all(n, me, dev, lambda t: x_ref.at[t], lambda s: o_ref.at[s],
++              local_sem, send_sem, recv_sem)
++
++
++def _call(kernel, x, out_shape, axes, mesh_axes, rows, n, sizes, name):
++    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
++    kw = {}
++    if INTERPRET is not None:
++        kw["interpret"] = INTERPRET
++    return pl.pallas_call(
++        functools.partial(kernel,
++                          axes=axes,
++                          sizes=sizes,
++                          n=n,
++                          rows=rows,
++                          mesh_axes=mesh_axes),
++        out_shape=out_shape,
++        in_specs=[hbm],
++        out_specs=hbm,
++        scratch_shapes=[pltpu.SemaphoreType.DMA] * 3,
++        compiler_params=pltpu.CompilerParams(collective_id=0,
++                                             has_side_effects=True),
++        name=name,
++        **kw,
++    )(x)
++
++
++def all_gather_local(x: jax.Array, axes: tuple[str, ...],
++                     mesh_axes: tuple[str, ...]) -> jax.Array:
++    """[rows, ...] per device -> [n * rows, ...], block i from rank i."""
++    sizes, n = _axes_info(axes)
++    rows = x.shape[0]
++    if n == 1:
++        return x
++    # Peer blocks live on a leading untiled axis: HBM row slices must be
++    # tile-aligned, and rows is usually 1 or 4.
++    out = jax.ShapeDtypeStruct((n, ) + x.shape, x.dtype)
++    out = _call(_ag_kernel, x, out, axes, mesh_axes, rows, n, sizes,
++                "oneshot_all_gather")
++    return out.reshape((n * rows, ) + x.shape[1:])
++
++
++def reduce_scatter_local(x: jax.Array,
++                         axes: tuple[str, ...],
++                         mesh_axes: tuple[str, ...],
++                         out_dtype=None) -> jax.Array:
++    """[n * rows, ...] partial sums -> [rows, ...] summed block of this rank."""
++    sizes, n = _axes_info(axes)
++    out_dtype = out_dtype or x.dtype
++    if n == 1:
++        return x.astype(out_dtype)
++    assert x.shape[0] % n == 0, (x.shape, n)
++    rows = x.shape[0] // n
++    x = x.reshape((n, rows) + x.shape[1:])
++    out = jax.ShapeDtypeStruct(x.shape, x.dtype)
++    recv = _call(_rs_kernel, x, out, axes, mesh_axes, rows, n, sizes,
++                 "oneshot_reduce_scatter")
++    acc = recv[0].astype(jnp.float32)
++    for i in range(1, n):
++        acc = acc + recv[i].astype(jnp.float32)
++    return acc.astype(out_dtype)
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index 677b973a8..85fea6cab 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -23,6 +23,7 @@ from jax.sharding import PartitionSpec as P
+ from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import gmm_v2
+ 
+ import tpu_inference.envs as envs
++from tpu_inference.kernels.collectives import oneshot
+ from tpu_inference.kernels.collectives.hierrs_sc import wrapper as hier_rs_sc
+ from tpu_inference.kernels.sparse_core.dense_gather_reduce import \
+     dense_gather_reduce
+@@ -96,8 +97,10 @@ _PACKED_ROUTE_LANES = 128
+ 
+ def packed_route_hidden_gather(
+         hidden_states: jax.Array, topk_indices: jax.Array,
+-        topk_weights: jax.Array, dtype: jnp.dtype,
+-        mesh: Mesh) -> tuple[jax.Array, jax.Array, jax.Array]:
++        topk_weights: jax.Array,
++        dtype: jnp.dtype,
++        mesh: Mesh,
++        use_oneshot: bool = False) -> tuple[jax.Array, jax.Array, jax.Array]:
+     """One all-gather for hidden states and routing metadata (H15b).
+ 
+     Replaces all_gather_topk_indices_and_weights plus the hidden-state
+@@ -108,6 +111,9 @@ def packed_route_hidden_gather(
+     order as both original gathers, and every value is moved bit-for-bit, so the
+     outputs equal (all_gather_topk_indices_and_weights(...), gathered hidden).
+ 
++    With use_oneshot the gather runs as the one-shot Pallas kernel
++    (kernels/collectives/oneshot.py) over the same axes; same bits.
++
+     Returns replicated (hidden_states, topk_indices, topk_weights) with
+     topk_weights cast to ``dtype`` like the original.
+     """
+@@ -132,8 +138,18 @@ def packed_route_hidden_gather(
+     # Like all_gather_topk_indices_and_weights: keep the compiler from moving
+     # the packing across the collective (or splitting it back into two).
+     packed = jax.lax.optimization_barrier(packed)
+-    gathered = jax.lax.with_sharding_constraint(
+-        packed, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
++    if use_oneshot:
++        attn_axes = _as_axes(ShardingAxisName.ATTN_DATA)
++        gathered = jax.shard_map(
++            lambda p: oneshot.all_gather_local(p, attn_axes, mesh.axis_names),
++            mesh=mesh,
++            in_specs=P(ShardingAxisName.ATTN_DATA, None),
++            out_specs=P(ShardingAxisName.MLP_DATA, None),
++            check_vma=False,
++        )(packed)
++    else:
++        gathered = jax.lax.with_sharding_constraint(
++            packed, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
+     hidden_out = jax.lax.bitcast_convert_type(gathered[:, :hidden_size],
+                                               hidden_states.dtype)
+     meta_out = jax.lax.bitcast_convert_type(
+@@ -298,7 +314,8 @@ def moe_gmm_local(x: jax.Array,
+                   scatter_results: bool = False,
+                   moe_chunk_size: int = 0,
+                   defer_all_reduce: bool = False,
+-                  hierarchical_collect: tuple | None = None) -> jax.Array:
++                  hierarchical_collect: tuple | None = None,
++                  oneshot_mesh_axes: tuple | None = None) -> jax.Array:
+     """Main MoE logic on a local shard can run in TP or EP mode.
+ 
+     Set parallelism for "tp" or "ep"
+@@ -447,7 +464,12 @@ def moe_gmm_local(x: jax.Array,
+             if reduce_axes:
+                 chunk_hidden = jax.lax.psum(chunk_hidden,
+                                             axis_name=reduce_axes)
+-            if scatter_axes:
++            if scatter_axes and oneshot_mesh_axes is not None:
++                out = oneshot.reduce_scatter_local(chunk_hidden,
++                                                   scatter_axes,
++                                                   oneshot_mesh_axes,
++                                                   out_dtype=x.dtype)
++            elif scatter_axes:
+                 out = jax.lax.psum_scatter(chunk_hidden,
+                                            axis_name=scatter_axes,
+                                            scatter_dimension=0,
+@@ -486,6 +508,7 @@ def tensor_parallel_gmm(
+     scatter_results: bool = False,
+     moe_chunk_size: int = 0,
+     defer_all_reduce: bool = False,
++    oneshot_scatter: bool = False,
+ ) -> jax.Array:
+     data_p_spec = P(ShardingAxisName.MLP_DATA)
+     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
+@@ -520,6 +543,7 @@ def tensor_parallel_gmm(
+             scatter_results=scatter_results,
+             moe_chunk_size=moe_chunk_size,
+             defer_all_reduce=defer_all_reduce,
++            oneshot_mesh_axes=(mesh.axis_names if oneshot_scatter else None),
+         ),
+         mesh=mesh,
+         in_specs=(
+@@ -983,8 +1007,13 @@ def fused_moe_func(
+                            and 4 * topk <= _PACKED_ROUTE_LANES)
+     if packed_route_gather:
+         logger.info_once("[MoE]: packed route+hidden all-gather (H15b)")
++        use_oneshot = (envs.MOE_ONESHOT_GATHER
++                       and num_tokens <= envs.MOE_ONESHOT_MAX_TOKENS)
++        if use_oneshot:
++            logger.info_once("[MoE]: one-shot packed dispatch all-gather")
+         hidden_states, topk_indices, topk_weights = packed_route_hidden_gather(
+-            hidden_states, topk_indices, topk_weights, dtype, mesh)
++            hidden_states, topk_indices, topk_weights, dtype, mesh,
++            use_oneshot)
+     elif get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
+         topk_indices, topk_weights = all_gather_topk_indices_and_weights(
+             topk_indices, topk_weights, dtype, mesh)
+@@ -1108,6 +1137,11 @@ def fused_moe_func(
+             defer_all_reduce=defer_all_reduce,
+         )
+     else:
++        oneshot_scatter = (envs.MOE_ONESHOT_SCATTER and scatter_results
++                           and not actual_enable_rs_kernel
++                           and num_tokens <= envs.MOE_ONESHOT_MAX_TOKENS)
++        if oneshot_scatter:
++            logger.info_once("[MoE]: one-shot output reduce-scatter")
+         x = tensor_parallel_gmm(
+             x,
+             w1,
+@@ -1127,6 +1161,7 @@ def fused_moe_func(
+             scatter_results=scatter_results,
+             moe_chunk_size=moe_chunk_size,
+             defer_all_reduce=defer_all_reduce,
++            oneshot_scatter=oneshot_scatter,
+         )
+ 
+     return x[:num_tokens, :hidden_size]

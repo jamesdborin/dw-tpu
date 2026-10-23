@@ -1,0 +1,16 @@
+{
+  "id": "dsv4-moe-overlap-coll32-2",
+  "owner": "dsv4-moe-overlap",
+  "kind": "micro32",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [],
+  "env": {},
+  "serve_args_extra": [],
+  "acceptance": "exact",
+  "bench": null,
+  "profile": true,
+  "est_minutes": 10,
+  "abort_if": ["any host still running after 15 min (run.sh has per-mode timeouts 420+200+200 s)"],
+  "success": "result.json has collectives timings for all three modes; ag_oneshot_bitwise_eq_xla_r{1,4} true; rs_oneshot_bitwise_eq_ordered_f32_r{1,4} true; moe r{1,4}_packed and r{1,4}_packed_osag bitwise_eq_base true. Speed: oneshot AG/RS faster than XLA AG/AR at decode sizes; split2 us_per_layer below base; split_check finite with meanabs at bf16 rounding level.",
+  "fallback": null
+}

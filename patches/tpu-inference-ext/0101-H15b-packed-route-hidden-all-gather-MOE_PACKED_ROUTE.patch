@@ -1,0 +1,131 @@
+From 43f7090d7580e71a2cc34b444e51efe96382fe8f Mon Sep 17 00:00:00 2001
+From: dsv4-moe-overlap <w@x>
+Date: Tue, 20 Oct 2026 16:48:15 +0100
+Subject: [PATCH 101/108] H15b: packed route+hidden all-gather
+ (MOE_PACKED_ROUTE_GATHER)
+
+---
+ tpu_inference/envs.py                        | 13 ++++
+ tpu_inference/layers/common/fused_moe_gmm.py | 71 +++++++++++++++++++-
+ 2 files changed, 83 insertions(+), 1 deletion(-)
+
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index 11f313aa6..371607ba8 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -86,6 +86,8 @@ if TYPE_CHECKING:
+     MIN_TOKEN_BUCKET: int = 16
+     MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
+     MOE_HIERARCHICAL_DISPATCH: bool = False
++    MOE_PACKED_ROUTE_GATHER: bool = False
++    MOE_PACKED_ROUTE_GATHER_MAX_TOKENS: int = 512
+     MOE_HIERARCHICAL_COLLECT: bool = False
+     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
+     RAGGED_GATHER_TRIM_ROWS: bool = True
+@@ -546,6 +548,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # USE_GMM_FUSED_RS_KERNEL. See fused_moe_gmm.py.
+     "MOE_HIERARCHICAL_DISPATCH":
+     env_bool("MOE_HIERARCHICAL_DISPATCH", default=False),
++    # H15b: with attention DP on the GMM-TP path, carry the top-k indices and
++    # weights in 128 extra uint16 columns of the hidden-state all-gather instead
++    # of a separate routing all-gather (one collective per MoE layer instead of
++    # two). Pure data movement: bit-identical results.
++    "MOE_PACKED_ROUTE_GATHER":
++    env_bool("MOE_PACKED_ROUTE_GATHER", default=False),
++    # Largest global token count (MoE input rows) that takes the packed gather.
++    # Larger (prefill) buckets keep the original two gathers: there the routing
++    # gather is negligible and the packed copy adds a full hidden-size temp.
++    "MOE_PACKED_ROUTE_GATHER_MAX_TOKENS":
++    lambda: int(os.getenv("MOE_PACKED_ROUTE_GATHER_MAX_TOKENS") or "512"),
+     # The reverse for the EP collect: each chip's two cores add column halves
+     # on-chip, then reduce-scatter half the columns over the attention-data
+     # axes. Same mesh and hidden-size conditions as MOE_HIERARCHICAL_DISPATCH.
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index a622a86d6..677b973a8 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -89,6 +89,62 @@ def all_gather_topk_indices_and_weights(
+     return topk_indices, topk_weights
+ 
+ 
++# Lane-tile width of the extra columns that carry the routing metadata in the
++# packed (H15b) gather.
++_PACKED_ROUTE_LANES = 128
++
++
++def packed_route_hidden_gather(
++        hidden_states: jax.Array, topk_indices: jax.Array,
++        topk_weights: jax.Array, dtype: jnp.dtype,
++        mesh: Mesh) -> tuple[jax.Array, jax.Array, jax.Array]:
++    """One all-gather for hidden states and routing metadata (H15b).
++
++    Replaces all_gather_topk_indices_and_weights plus the hidden-state
++    all-gather XLA inserts for the dispatch shard_map. Each row carries its
++    hidden vector bitcast to uint16, then its int32 top-k indices and float32
++    top-k weights bitcast to uint16 pairs, zero-padded to one 128-lane tile.
++    Rows are gathered over the same attention-data axes and the same global row
++    order as both original gathers, and every value is moved bit-for-bit, so the
++    outputs equal (all_gather_topk_indices_and_weights(...), gathered hidden).
++
++    Returns replicated (hidden_states, topk_indices, topk_weights) with
++    topk_weights cast to ``dtype`` like the original.
++    """
++    num_tokens, hidden_size = hidden_states.shape
++    top_k = topk_indices.shape[-1]
++    meta_cols = 4 * top_k  # (index, weight) x 2 uint16 halves per expert slot
++    assert meta_cols <= _PACKED_ROUTE_LANES, top_k
++    hidden_u16 = jax.lax.bitcast_convert_type(hidden_states, jnp.uint16)
++    idx = topk_indices.astype(jnp.int32)
++    wts = jax.lax.bitcast_convert_type(topk_weights.astype(jnp.float32),
++                                       jnp.int32)
++    meta = jnp.concatenate([idx, wts], axis=-1)  # [T, 2k] int32
++    meta_u16 = jax.lax.bitcast_convert_type(meta, jnp.uint16).reshape(
++        num_tokens, meta_cols)
++    packed = jnp.concatenate([
++        hidden_u16, meta_u16,
++        jnp.zeros((num_tokens, _PACKED_ROUTE_LANES - meta_cols), jnp.uint16)
++    ],
++                             axis=1)
++    packed = jax.lax.with_sharding_constraint(
++        packed, NamedSharding(mesh, P(ShardingAxisName.ATTN_DATA, None)))
++    # Like all_gather_topk_indices_and_weights: keep the compiler from moving
++    # the packing across the collective (or splitting it back into two).
++    packed = jax.lax.optimization_barrier(packed)
++    gathered = jax.lax.with_sharding_constraint(
++        packed, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
++    hidden_out = jax.lax.bitcast_convert_type(gathered[:, :hidden_size],
++                                              hidden_states.dtype)
++    meta_out = jax.lax.bitcast_convert_type(
++        gathered[:, hidden_size:hidden_size + meta_cols].reshape(
++            num_tokens, 2 * top_k, 2), jnp.int32)
++    topk_indices = meta_out[:, :top_k]
++    topk_weights = jax.lax.bitcast_convert_type(meta_out[:, top_k:],
++                                                jnp.float32).astype(dtype)
++    return hidden_out, topk_indices, topk_weights
++
++
+ def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
+     match scoring_fn:
+         case "softmax":
+@@ -916,7 +972,20 @@ def fused_moe_func(
+         topk_indices = jnp.where(token_valid, topk_indices, 0)
+         topk_weights = jnp.where(token_valid, topk_weights, 0.0)
+     # All gathering topk_indices and topk_weights if attention dp is used.
+-    if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
++    packed_route_gather = (envs.MOE_PACKED_ROUTE_GATHER and not use_ep
++                           and num_tokens <= envs.MOE_PACKED_ROUTE_GATHER_MAX_TOKENS
++                           and not all_gather_fp8
++                           and get_mesh_shape_product(
++                               mesh, ShardingAxisName.ATTN_DATA) > 1
++                           and get_mesh_shape_product(
++                               mesh, ShardingAxisName.MLP_DATA) == 1
++                           and jnp.dtype(hidden_states.dtype).itemsize == 2
++                           and 4 * topk <= _PACKED_ROUTE_LANES)
++    if packed_route_gather:
++        logger.info_once("[MoE]: packed route+hidden all-gather (H15b)")
++        hidden_states, topk_indices, topk_weights = packed_route_hidden_gather(
++            hidden_states, topk_indices, topk_weights, dtype, mesh)
++    elif get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
+         topk_indices, topk_weights = all_gather_topk_indices_and_weights(
+             topk_indices, topk_weights, dtype, mesh)
+     topk_weights = topk_weights.astype(dtype)

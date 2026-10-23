@@ -1,0 +1,184 @@
+diff --git a/tests/distributed/test_tpu_connector_dsv4_dp_sched_cpu.py b/tests/distributed/test_tpu_connector_dsv4_dp_sched_cpu.py
+index 5ccc43c7f..eadd26ed7 100644
+--- a/tests/distributed/test_tpu_connector_dsv4_dp_sched_cpu.py
++++ b/tests/distributed/test_tpu_connector_dsv4_dp_sched_cpu.py
+@@ -140,14 +140,23 @@ def test_dp_pd_flow():
+         # Pulls done: each rank gets only its own ids (vLLM asserts).
+         done = {r.request_id for r in dreqs}
+         so, _ = d.step(finished_recving=done)
+-        inserts = dict(so.kv_connector_metadata.reqs_to_load
+-                       ) if so.kv_connector_metadata else {}
++        inserts = {}
++
++        def add_inserts(so):
++            new = so.kv_connector_metadata.reqs_to_load if (
++                so.kv_connector_metadata) else {}
++            # A step that inserts pulled KV starts its loads before the
++            # forward (has_sync_kv_loads survives the DP combine).
++            assert so.has_sync_kv_loads == any(
++                m.remote_block_ids is None for m in new.values())
++            inserts.update(new)
++
++        add_inserts(so)
+         for _ in range(3):
+             if len(inserts) == len(dreqs):
+                 break
+             so, _ = d.step()
+-            if so.kv_connector_metadata is not None:
+-                inserts.update(so.kv_connector_metadata.reqs_to_load)
++            add_inserts(so)
+         assert set(inserts) == done
+         assert all(m.remote_block_ids is None for m in inserts.values())
+         for _ in range(10):
+diff --git a/tests/distributed/test_tpu_connector_dsv4_sched_cpu.py b/tests/distributed/test_tpu_connector_dsv4_sched_cpu.py
+index e82c23bca..5e2b413ee 100644
+--- a/tests/distributed/test_tpu_connector_dsv4_sched_cpu.py
++++ b/tests/distributed/test_tpu_connector_dsv4_sched_cpu.py
+@@ -7,6 +7,7 @@ transfer plan only reads P blocks that exist and covers every block D needs.
+   JAX_PLATFORMS=cpu python -m pytest -q tests/distributed/test_tpu_connector_dsv4_sched_cpu.py
+ """
+ import os
++import types
+ 
+ import vllm.platforms as _vp
+ 
+@@ -167,6 +168,43 @@ def _check_plan(num_tokens, p_ids, d_ids, hit, groups):
+                 assert i in covered, f"group {gid} block {i} not transferred"
+ 
+ 
++def _load_order(scheduler_output):
++    """Order of start_load_kv vs the forward in vLLM's runner mixin."""
++    from vllm.v1.worker import kv_connector_model_runner_mixin as mixin
++
++    events = []
++
++    class Recorder:
++
++        def bind_connector_metadata(self, meta):
++            pass
++
++        def start_load_kv(self, ctx, **kwargs):
++            events.append("start_load_kv")
++
++        def get_transfer_results(self, finished_req_ids):
++            return types.SimpleNamespace(finished_sending=None,
++                                         finished_recving=None,
++                                         failed_recving=None)
++
++        def __getattr__(self, name):
++            return lambda *a, **k: None
++
++    orig = (mixin.get_kv_transfer_group, mixin.get_forward_context,
++            mixin.KVConnectorBase)
++    mixin.get_kv_transfer_group = Recorder
++    mixin.get_forward_context = lambda: None
++    mixin.KVConnectorBase = Recorder
++    try:
++        with mixin.KVConnectorModelRunnerMixin._get_kv_connector_output(
++                scheduler_output):
++            events.append("forward")
++    finally:
++        (mixin.get_kv_transfer_group, mixin.get_forward_context,
++         mixin.KVConnectorBase) = orig
++    return events
++
++
+ @pytest.mark.parametrize("align", [None, 4, 128, 1024])
+ @pytest.mark.parametrize("num_tokens,d_prefix", [(5000, 0), (3000, 0),
+                                                  (5000, 2048), (700, 0),
+@@ -202,6 +240,8 @@ def test_pd_flow(num_tokens, d_prefix, align):
+     so, _ = _step(d)
+     load = so.kv_connector_metadata.reqs_to_load[dreq.request_id]
+     assert dreq.status == RequestStatus.WAITING_FOR_REMOTE_KVS
++    # Issuing the pull does not feed this step's forward.
++    assert not so.has_sync_kv_loads
+     assert load.remote_block_ids is not None
+     assert load.local_hit_tokens == d_prefix, load.local_hit_tokens
+     _check_plan(target, send_meta.local_block_ids, load.local_block_ids,
+@@ -216,6 +256,9 @@ def test_pd_flow(num_tokens, d_prefix, align):
+         1, num_tokens - target)
+     insert = so.kv_connector_metadata.reqs_to_load[dreq.request_id]
+     assert insert.remote_block_ids is None
++    # The insert feeds this step's forward, so it must run before it.
++    assert so.has_sync_kv_loads
++    assert _load_order(so) == ["start_load_kv", "forward"]
+     for g, (x, y) in enumerate(zip(load.local_block_ids,
+                                    insert.local_block_ids)):
+         assert y[:len(x)] == x, (g, x, y)
+diff --git a/tests/runner/test_pd_debug_dump_cpu.py b/tests/runner/test_pd_debug_dump_cpu.py
+index 8bb290034..0460e72c7 100644
+--- a/tests/runner/test_pd_debug_dump_cpu.py
++++ b/tests/runner/test_pd_debug_dump_cpu.py
+@@ -55,5 +55,5 @@ def test_dump(tmp_path, monkeypatch):
+     # group 0 arrays: a (0) and a_rope (1); group 1: b (1), c (2)
+     assert set(rec["kv"]) == {"0/1/0", "0/1/1", "0/2/0", "0/2/1", "1/0/1",
+                               "1/0/2", "1/1/1", "1/1/2"}
+-    assert all(len(v) == 2 and v[0] == v[1] for v in rec["kv"].values())
++    assert all(len(set(v)) == 1 for v in rec["kv"].values())  # replicas equal
+     assert rec["blocks"][0]["block_table_row"] == [0, 2, 3]
+diff --git a/tpu_inference/core/sched/dp_scheduler.py b/tpu_inference/core/sched/dp_scheduler.py
+index c9ecd8371..5d8b08378 100644
+--- a/tpu_inference/core/sched/dp_scheduler.py
++++ b/tpu_inference/core/sched/dp_scheduler.py
+@@ -1094,6 +1094,10 @@ class DPScheduler(SchedulerInterface):
+         pending_structured_output_tokens = any(
+             getattr(o, "pending_structured_output_tokens", False)
+             for o in rank_outputs)
++        # A rank's KV connector may need its loads to start before the
++        # forward (e.g. TPUConnector inserting pulled KV).
++        has_sync_kv_loads = any(
++            getattr(o, "has_sync_kv_loads", False) for o in rank_outputs)
+ 
+         return DPSchedulerOutput(
+             scheduled_new_reqs=all_new_reqs,
+@@ -1112,6 +1116,7 @@ class DPScheduler(SchedulerInterface):
+             aux_output_connector_metadata=combined_aux_output_metadata,
+             has_structured_output_requests=has_structured_output_requests,
+             pending_structured_output_tokens=pending_structured_output_tokens,
++            has_sync_kv_loads=has_sync_kv_loads,
+         )
+ 
+     @staticmethod
+diff --git a/tpu_inference/distributed/tpu_connector.py b/tpu_inference/distributed/tpu_connector.py
+index 8aab64914..7af38eabe 100644
+--- a/tpu_inference/distributed/tpu_connector.py
++++ b/tpu_inference/distributed/tpu_connector.py
+@@ -59,6 +59,7 @@ D workflow:
+ """
+ 
+ import copy
++import os
+ import datetime
+ import threading
+ import time
+@@ -177,7 +178,16 @@ class TPUConnector(KVConnectorBase_V1):
+         scheduler_output: SchedulerOutput,
+     ) -> TPUConnectorMetadata:
+         assert self.connector_scheduler is not None
+-        return self.connector_scheduler.build_connector_meta()
++        meta = self.connector_scheduler.build_connector_meta()
++        # A load meta without remote_block_ids makes the worker insert the
++        # pulled KV in start_load_kv, and this step's forward reads it. vLLM
++        # starts loads after the forward unless the step has sync loads.
++        # DSV4_PD_SYNC_INSERT=0 restores the old order (for A/B tests only).
++        if os.getenv("DSV4_PD_SYNC_INSERT", "1") != "0" and any(
++                m.remote_block_ids is None
++                for m in meta.reqs_to_load.values()):
++            scheduler_output.has_sync_kv_loads = True
++        return meta
+ 
+     def request_finished(
+         self,
+@@ -699,8 +709,10 @@ class TPUConnectorWorker:
+ 
+     def process_send_load(self, metadata: TPUConnectorMetadata):
+         """
+-        This is called in runner before calling model forward,
+-        whenever the scheduler_output.total_num_scheduled_tokens is empty or not.
++        This is called in runner before calling model forward when the step
++        inserts pulled KV (TPUConnector.build_connector_meta sets
++        has_sync_kv_loads), otherwise after it, whenever the
++        scheduler_output.total_num_scheduled_tokens is empty or not.
+         """
+         reqs = metadata.reqs_to_send
+         if reqs:

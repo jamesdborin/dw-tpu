@@ -1,0 +1,22 @@
+diff --git a/tpu_inference/kernels/experimental/deepseek_v4/indexer/streamindex_topk.py b/tpu_inference/kernels/experimental/deepseek_v4/indexer/streamindex_topk.py
+index 697486c..8c30075 100644
+--- a/tpu_inference/kernels/experimental/deepseek_v4/indexer/streamindex_topk.py
++++ b/tpu_inference/kernels/experimental/deepseek_v4/indexer/streamindex_topk.py
+@@ -348,7 +348,7 @@ def _scores_kernel(
+                 k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
+                     jnp.int32, s_summed.shape, 1)
+                 valid_mask = k_span < kv_lens[batch_idx]
+-                causal_mask = k_span <= bq_pos_compressed[:, None]
++                causal_mask = k_span < bq_pos_compressed[:, None]
+                 mask = jnp.logical_and(valid_mask, causal_mask)
+                 s_summed = jnp.where(mask, s_summed, -jnp.inf)
+                 ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
+@@ -370,7 +370,7 @@ def _scores_kernel(
+             for batch_idx in range(seq_batch_size):
+                 q_pos = (seq_lens[batch_idx] - q_lens[batch_idx] +
+                          bq_idx * bq_sz + jnp.arange(bq_sz, dtype=jnp.int32))
+-                bq_pos_compressed_vec.append(q_pos // compression_ratio)
++                bq_pos_compressed_vec.append((q_pos + 1) // compression_ratio)
+ 
+             # Wait for cur bq if not ready yet
+             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)

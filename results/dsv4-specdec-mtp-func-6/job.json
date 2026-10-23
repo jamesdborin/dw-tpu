@@ -1,0 +1,38 @@
+{
+  "id": "dsv4-specdec-mtp-func-6",
+  "owner": "dsv4-specdec",
+  "kind": "e2e",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [
+    "dsv4-moe-overlap-e2e-base-0"
+  ],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "0",
+    "RAY_DEDUP_LOGS": "0",
+    "DRAFT_MODEL_IMPL_TYPE": "vllm",
+    "GPU_MEM": "0.62",
+    "DP_SCHED_BATCH_PREFILL_IDLE_FLUSH": "0",
+    "DP_SCHED_BATCH_PREFILL_MAX_WAIT_MS": "2000"
+  },
+  "serve_args_extra": [
+    "--speculative-config",
+    "{\"method\": \"mtp\", \"num_speculative_tokens\": 3, \"disable_eagle_block_drop\": true}"
+  ],
+  "acceptance": "sampling-equivalent",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": false,
+  "est_minutes": 80,
+  "abort_if": [
+    "post-ready RESOURCE_EXHAUSTED",
+    "launch-id mismatch",
+    "startup > 55 min",
+    "acceptance gate failure"
+  ],
+  "success": "Same gates as func-5 (passed there). Perf: 32-agent tok/s/user > base-0 25.30; expected ~35-40. Check bench iteration-token histogram: prefill should be batched (few >2048-token iterations, ~30 like base-0) and decode iterations <=128 tokens.",
+  "fallback": null
+}

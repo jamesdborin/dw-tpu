@@ -1,0 +1,94 @@
+From 11b7befe95a3139b311d5567172c24735386ca7b Mon Sep 17 00:00:00 2001
+From: dsv4-moe-overlap <w@x>
+Date: Wed, 21 Oct 2026 17:12:21 +0100
+Subject: [PATCH 107/108] GMM_EP: packed route gather, MOE_F32_REDUCE and
+ one-shot reduce-scatter
+
+---
+ tpu_inference/layers/common/fused_moe_gmm.py | 31 +++++++++++++++-----
+ 1 file changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index 43234c861..e7a70e4cf 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -464,7 +464,17 @@ def moe_gmm_local(x: jax.Array,
+         cur_weights = topk_weights[start_tok:end_tok]
+         cur_mask = mask[start_tok:end_tok]
+ 
+-        if local_group_size < group_sizes.size and not tp_split:
++        if local_group_size < group_sizes.size and not tp_split and f32_reduce:
++            # MOE_F32_REDUCE under expert parallelism: f32 combine of this
++            # shard's own experts (rows of other shards' experts are masked;
++            # they may hold stale HBM bits, so select rather than multiply).
++            rows = gmm2_res[cur_indices].reshape(
++                -1, topk, gmm2_res.shape[-1]).astype(jnp.float32)
++            chunk_hidden = jnp.sum(jnp.where(
++                cur_mask, rows * cur_weights.astype(jnp.float32)[..., None],
++                0.0),
++                                   axis=1)
++        elif local_group_size < group_sizes.size and not tp_split:
+             if onehot_moe_permute_threshold > 0 and batch_size <= onehot_moe_permute_threshold:
+                 revert_indices = cur_indices.reshape(-1, topk)
+                 onehot = jax.nn.one_hot(revert_indices,
+@@ -654,6 +664,8 @@ def expert_parallel_gmm(
+     moe_chunk_size: int = 0,
+     scatter_results: bool = False,
+     defer_all_reduce: bool = False,
++    f32_reduce: bool = False,
++    oneshot_scatter: bool = False,
+ ) -> jax.Array:
+     ep_size = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
+     ep_p_spec = P(ShardingAxisName.EXPERT)
+@@ -693,6 +705,8 @@ def expert_parallel_gmm(
+             moe_chunk_size=moe_chunk_size,
+             defer_all_reduce=defer_all_reduce,
+             hierarchical_collect=hierarchical_collect,
++            f32_reduce=f32_reduce,
++            oneshot_mesh_axes=(mesh.axis_names if oneshot_scatter else None),
+         ),
+         mesh=mesh,
+         in_specs=(
+@@ -1062,7 +1076,8 @@ def fused_moe_func(
+         topk_indices = jnp.where(token_valid, topk_indices, 0)
+         topk_weights = jnp.where(token_valid, topk_weights, 0.0)
+     # All gathering topk_indices and topk_weights if attention dp is used.
+-    packed_route_gather = (envs.MOE_PACKED_ROUTE_GATHER and not use_ep
++    packed_route_gather = (envs.MOE_PACKED_ROUTE_GATHER
++                           and not (use_ep and envs.MOE_HIERARCHICAL_DISPATCH)
+                            and num_tokens <= envs.MOE_PACKED_ROUTE_GATHER_MAX_TOKENS
+                            and not all_gather_fp8
+                            and get_mesh_shape_product(
+@@ -1181,6 +1196,11 @@ def fused_moe_func(
+             f"Error when padding input hidden states from {hidden_size} to {padded_hidden_size}."
+         ) from e
+ 
++    oneshot_scatter = (envs.MOE_ONESHOT_SCATTER and scatter_results
++                       and not actual_enable_rs_kernel
++                       and num_tokens <= envs.MOE_ONESHOT_MAX_TOKENS)
++    if oneshot_scatter:
++        logger.info_once("[MoE]: one-shot output reduce-scatter")
+     if use_ep:
+         x = expert_parallel_gmm(
+             x,
+@@ -1201,6 +1221,8 @@ def fused_moe_func(
+             scatter_results=scatter_results,
+             moe_chunk_size=moe_chunk_size,
+             defer_all_reduce=defer_all_reduce,
++            f32_reduce=bool(envs.MOE_F32_REDUCE and scatter_results),
++            oneshot_scatter=oneshot_scatter,
+         )
+     else:
+         shared_partial = None
+@@ -1222,11 +1244,6 @@ def fused_moe_func(
+                 out_specs=P(ShardingAxisName.MLP_TENSOR, None),
+                 check_vma=False,
+             )(hidden_states, shared_w_gu, shared_w_down)
+-        oneshot_scatter = (envs.MOE_ONESHOT_SCATTER and scatter_results
+-                           and not actual_enable_rs_kernel
+-                           and num_tokens <= envs.MOE_ONESHOT_MAX_TOKENS)
+-        if oneshot_scatter:
+-            logger.info_once("[MoE]: one-shot output reduce-scatter")
+         x = tensor_parallel_gmm(
+             x,
+             w1,

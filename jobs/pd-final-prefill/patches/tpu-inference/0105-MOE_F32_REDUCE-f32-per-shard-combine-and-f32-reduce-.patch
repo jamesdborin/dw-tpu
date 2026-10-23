@@ -1,0 +1,90 @@
+From 4f18530e19efec62f9a14cf226fcbfc3114d59fe Mon Sep 17 00:00:00 2001
+From: dsv4-moe-overlap <w@x>
+Date: Wed, 21 Oct 2026 07:50:15 +0100
+Subject: [PATCH] MOE_F32_REDUCE: f32 per-shard combine and f32 reduce-scatter
+ of the routed partials
+
+---
+ tpu_inference/envs.py                        |  7 +++++++
+ tpu_inference/layers/common/fused_moe_gmm.py | 15 ++++++++++++++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index c1ca6a46b..719d43467 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -93,6 +93,7 @@ if TYPE_CHECKING:
+     MOE_ONESHOT_MAX_TOKENS: int = 512
+     MOE_TP_EXPERT_SPLIT: int = 1
+     MOE_SHARED_EXPERT_TP: bool = False
++    MOE_F32_REDUCE: bool = False
+     MOE_HIERARCHICAL_COLLECT: bool = False
+     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
+     RAGGED_GATHER_TRIM_ROWS: bool = True
+@@ -591,6 +592,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Reduction-order change. See layers/common/shared_expert_tp.py.
+     "MOE_SHARED_EXPERT_TP":
+     env_bool("MOE_SHARED_EXPERT_TP", default=False),
++    # GMM_TP + attention DP: combine each shard's routed partial in f32 and
++    # reduce-scatter f32 partials (one bf16 rounding of the MoE output instead
++    # of one per shard plus the collective's own). More accurate than the
++    # default; the collective moves twice the bytes.
++    "MOE_F32_REDUCE":
++    env_bool("MOE_F32_REDUCE", default=False),
+     # The reverse for the EP collect: each chip's two cores add column halves
+     # on-chip, then reduce-scatter half the columns over the attention-data
+     # axes. Same mesh and hidden-size conditions as MOE_HIERARCHICAL_DISPATCH.
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index c223d424d..e68070ba1 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -335,7 +335,8 @@ def moe_gmm_local(x: jax.Array,
+                   defer_all_reduce: bool = False,
+                   hierarchical_collect: tuple | None = None,
+                   oneshot_mesh_axes: tuple | None = None,
+-                  routed_scale: float = 1.0) -> jax.Array:
++                  routed_scale: float = 1.0,
++                  f32_reduce: bool = False) -> jax.Array:
+     """Main MoE logic on a local shard can run in TP or EP mode.
+ 
+     Set parallelism for "tp" or "ep"
+@@ -468,6 +469,15 @@ def moe_gmm_local(x: jax.Array,
+                 chunk_hidden = ragged_gather_reduce(gmm2_res, cur_indices,
+                                                     cur_weights.reshape(-1),
+                                                     cur_mask.reshape(-1), topk)
++        elif f32_reduce:
++            # MOE_F32_REDUCE: keep this shard's combined partial in f32 (the
++            # dense_gather_reduce fallback accumulates in f32 and then rounds
++            # to bf16); the reduce-scatter below then adds f32 partials and the
++            # result is rounded to bf16 once.
++            rows = gmm2_res[topk_argsort_revert_indices].reshape(
++                -1, topk, gmm2_res.shape[-1]).astype(jnp.float32)
++            chunk_hidden = jnp.sum(
++                rows * topk_weights.astype(jnp.float32)[..., None], axis=1)
+         else:
+             chunk_hidden = dense_gather_reduce(
+                 gmm2_res,
+@@ -544,6 +554,7 @@ def tensor_parallel_gmm(
+     oneshot_scatter: bool = False,
+     shared_partial: jax.Array | None = None,
+     routed_scale: float = 1.0,
++    f32_reduce: bool = False,
+ ) -> jax.Array:
+     data_p_spec = P(ShardingAxisName.MLP_DATA)
+     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
+@@ -580,6 +591,7 @@ def tensor_parallel_gmm(
+             defer_all_reduce=defer_all_reduce,
+             oneshot_mesh_axes=(mesh.axis_names if oneshot_scatter else None),
+             routed_scale=routed_scale,
++            f32_reduce=f32_reduce,
+         ),
+         mesh=mesh,
+         in_specs=(
+@@ -1229,6 +1241,7 @@ def fused_moe_func(
+             oneshot_scatter=oneshot_scatter,
+             shared_partial=shared_partial,
+             routed_scale=routed_scale if shared_partial is not None else 1.0,
++            f32_reduce=bool(envs.MOE_F32_REDUCE and scatter_results),
+         )
+ 
+     return x[:num_tokens, :hidden_size]

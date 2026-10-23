@@ -1,0 +1,178 @@
+diff --git a/tpu_inference/layers/jax/sample/sampling.py b/tpu_inference/layers/jax/sample/sampling.py
+index c8583ca..e8909ba 100644
+--- a/tpu_inference/layers/jax/sample/sampling.py
++++ b/tpu_inference/layers/jax/sample/sampling.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import os
+ from dataclasses import dataclass, replace
+ from typing import TYPE_CHECKING, Dict, List, Optional
+ 
+@@ -25,6 +26,7 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES
+ from vllm.v1.outputs import LogprobsTensors
+ 
+ from tpu_inference import envs
++from tpu_inference.utils import device_array
+ from tpu_inference.layers.common.binary_search import topk_mask, topp_mask
+ from tpu_inference.layers.common.sharding import ShardingAxisName
+ from tpu_inference.layers.jax.sample.sampling_metadata import \
+@@ -466,6 +468,11 @@ def _build_prompt_target_ids(
+             snap.req_state.prompt_token_ids[s:s + snap.num_logits],
+             dtype=np.int32)
+     if mesh is not None:
++        if os.environ.get("TPU_ASYNC_REPLICATE_OUTPUTS", "0") == "1":
++            # Same deterministic target buffer on every worker. Reuse the
++            # Ray per-host callback placement used by ordinary input metadata;
++            # do not inject an implicit host assert_equal/process_allgather.
++            return device_array(mesh, targets, sharding=NamedSharding(mesh, P()))
+         return jax.device_put(targets, NamedSharding(mesh, P()))
+     return jax.device_put(targets)
+ 
+diff --git a/tpu_inference/runner/async_host_output.py b/tpu_inference/runner/async_host_output.py
+new file mode 100644
+index 0000000..22e8ee0
+--- /dev/null
++++ b/tpu_inference/runner/async_host_output.py
+@@ -0,0 +1,26 @@
++"""Prepare complete local async-output buffers from the all-worker path.
++
++Every process must call this in the same order. Any reshard collective is
++scheduled here, never in the designated output rank's background thread.
++"""
++import jax
++from jax.sharding import NamedSharding, PartitionSpec
++
++
++def prepare_async_host_output(value, mesh):
++    replicated_sharding = NamedSharding(mesh, PartitionSpec())
++
++    def local_copy(leaf):
++        if not isinstance(leaf, jax.Array):
++            return leaf
++        if not leaf.is_fully_addressable:
++            if not leaf.is_fully_replicated:
++                leaf = jax.device_put(leaf, replicated_sharding)
++            if not leaf.addressable_shards:
++                raise RuntimeError("Async output requires a local replicated shard")
++            leaf = leaf.addressable_shards[0].data
++        if not leaf.is_fully_addressable:
++            raise RuntimeError("Async output still contains a nonlocal array")
++        return jax.copy_to_host_async(leaf)
++
++    return jax.tree_util.tree_map(local_copy, value)
+diff --git a/tpu_inference/runner/tpu_runner.py b/tpu_inference/runner/tpu_runner.py
+index b560462..ac47468 100644
+--- a/tpu_inference/runner/tpu_runner.py
++++ b/tpu_inference/runner/tpu_runner.py
+@@ -14,6 +14,7 @@
+ 
+ import functools
+ import logging
++import os
+ import random
+ import sys
+ from contextlib import nullcontext
+@@ -71,6 +72,7 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
+     JaxIntermediateTensors
+ from tpu_inference.runner import utils as runner_utils
+ from tpu_inference.runner.compilation_manager import CompilationManager
++from tpu_inference.runner.async_host_output import prepare_async_host_output
+ from tpu_inference.runner.decode_loop import TpuSamplingState, continue_decode
+ from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
+ from tpu_inference.runner.kv_cache_manager import KVCacheManager
+@@ -390,6 +392,19 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
+                  routed_experts_block_ids: Optional[Dict[str,
+                                                          List[int]]] = None,
+                  runner=None):
++        if os.environ.get("TPU_ASYNC_REPLICATE_OUTPUTS", "0") == "1":
++            if runner is None:
++                raise ValueError("Replicated async outputs require a runner")
++            prompt_tensors = (prompt_logprobs_async_data.tensors
++                              if prompt_logprobs_async_data is not None else None)
++            next_tokens, logprobs_tensors, prompt_tensors, expert_indices = (
++                prepare_async_host_output(
++                    (next_tokens, logprobs_tensors, prompt_tensors, expert_indices),
++                    runner.mesh))
++            if prompt_logprobs_async_data is not None:
++                prompt_logprobs_async_data = PromptLogprobsAsyncData(
++                    tensors=prompt_tensors,
++                    req_snaps=prompt_logprobs_async_data.req_snaps)
+         self._model_runner_output = model_runner_output
+         self._next_tokens = next_tokens
+         self._num_reqs = num_reqs
+@@ -848,6 +863,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+         """Generative model or pooling model select different computations."""
+         self.enable_continue_decode = self.vllm_config.additional_config.get(
+             "enable_continue_decode", False)
++        if (os.environ.get("TPU_ASYNC_REPLICATE_OUTPUTS", "0") == "1"
++                and self.scheduler_config.async_scheduling
++                and (self.enable_continue_decode or self.speculative_config)):
++            raise ValueError("H4 replicated async output is validated only without "
++                             "continue_decode or speculative decoding")
+         # continue_decode EOS-check interval: how often the fused decode loop
+         # observes the any-sequence-hit-EOS early exit (see decode_loop.py). Set
+         # via the CONTINUE_DECODE_EOS_CHECK_INTERVAL env var so it can be retuned
+@@ -2181,6 +2201,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+                 self.dp_size,
+                 max_logprobs=self.model_config.max_logprobs,
+             )
++            self._finish_prompt_logprob_dispatch(prompt_logprobs_async)
+ 
+         num_reqs = self.input_batch.num_reqs
+ 
+@@ -2263,6 +2284,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+                     scheduler_output, logits_indices_selector,
+                     spec_decode_metadata)
+ 
++            # Preserve the globally sharded buffer for on-device substitution.
++            next_tokens_in_tpu = next_tokens
++            # All ranks reshard before any output-thread materialization.
++            # Keep the same local complete buffer for next-step bookkeeping.
++            if os.environ.get("TPU_ASYNC_REPLICATE_OUTPUTS", "0") == "1":
++                next_tokens = prepare_async_host_output(next_tokens, self.mesh)
+             # Save the previous results
+             next_tokens = jax.copy_to_host_async(next_tokens)
+             self._pre_async_results = AsyncPreResults(
+@@ -2279,6 +2306,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+                 spec_decode_metadata=spec_decode_metadata,
+             )
+ 
++            if os.environ.get("TPU_ASYNC_REPLICATE_OUTPUTS", "0") == "1":
++                self._pre_async_results.next_tokens_in_tpu = next_tokens_in_tpu
++
+             # Return Model output to executor
+             model_runner_output = ModelRunnerOutput(
+                 req_ids=req_ids,
+@@ -2440,6 +2470,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+ 
+         return ret
+ 
++    def _finish_prompt_logprob_dispatch(self, data):
++        """Every worker commits device-dispatch state before the next step.
++
++        Output resolution runs only on the output rank. It must not decide
++        whether the next all-worker step launches the full logits head or
++        prompt-logprob collectives.
++        """
++        if (os.environ.get("TPU_ASYNC_REPLICATE_OUTPUTS", "0") != "1"
++                or data is None):
++            return
++        for snap in data.req_snaps:
++            if snap.is_last_chunk and self.requests.get(snap.req_id) is snap.req_state:
++                self.input_batch.num_prompt_logprobs.pop(snap.req_id, None)
++
+     def _get_prompt_logprobs_dict(
+         self,
+         data: "PromptLogprobsAsyncData",
+@@ -2486,7 +2530,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+                 completed_snaps.append(snap)
+ 
+         for snap in completed_snaps:
+-            self.input_batch.num_prompt_logprobs.pop(snap.req_id, None)
++            if os.environ.get("TPU_ASYNC_REPLICATE_OUTPUTS", "0") != "1":
++                self.input_batch.num_prompt_logprobs.pop(snap.req_id, None)
+             snap.req_state.in_progress_prompt_logprobs_cpu = None
+ 
+         return prompt_logprobs_dict

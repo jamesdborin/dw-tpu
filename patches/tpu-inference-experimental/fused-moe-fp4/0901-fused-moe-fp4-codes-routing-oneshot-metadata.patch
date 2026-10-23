@@ -1,0 +1,790 @@
+From 32c4cd518973794482576c31f20c8c307f7a9b92 Mon Sep 17 00:00:00 2001
+From: dsv4-fusedmoe-fp4 <james.dborin@doubleword.ai>
+Date: Wed, 21 Oct 2026 17:48:41 +0100
+Subject: [PATCH 1/2] fused_ep_moe fp4 codes, precomputed routing, GMM_EP
+ layout, oneshot metadata; FUSED_MOE_FP4_EMULATION integration
+
+---
+ tpu_inference/envs.py                         |  20 +
+ tpu_inference/kernels/fused_moe/v1/kernel.py  | 341 +++++++++++++++---
+ tpu_inference/layers/common/moe.py            | 105 ++++++
+ .../common/process_weights/moe_weights.py     |   6 +-
+ 4 files changed, 422 insertions(+), 50 deletions(-)
+
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index 11f313aa6..94bed1565 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -24,6 +24,9 @@ if TYPE_CHECKING:
+     AGGREGATED_STATS_DIR: str = ""
+     PYTHON_TRACER_LEVEL: int = 1
+     USE_MOE_EP_KERNEL: bool = False
++    FUSED_MOE_FP4_EMULATION: bool = False
++    FUSED_MOE_BLOCK_SIZES: str = ""
++    FUSED_MOE_ONESHOT_METADATA: bool = False
+     USE_UNFUSED_MEGABLOCKS: bool = False
+     USE_DENSE_MOE: bool = False
+     NUM_SLICES: int = 1
+@@ -287,6 +290,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Use custom expert-parallel kernel for MoE (Mixture of Experts)
+     "USE_MOE_EP_KERNEL":
+     env_bool("USE_MOE_EP_KERNEL", default=False),
++    # FUSED_MOE (USE_MOE_EP_KERNEL=1) with fp4 expert weights on TPUs without
++    # f4 vectors (v6e): store them as tokamax gmm_v2 uint4 codes and decode
++    # in the fused_ep_moe kernel; routing (any scoring function, correction
++    # bias, hash routing, padding-to-expert-0) is computed outside the kernel
++    # exactly as on the GMM path. Requires a mesh whose only non-1 axes are
++    # the expert-parallel ones. See layers/common/moe.py.
++    "FUSED_MOE_FP4_EMULATION":
++    env_bool("FUSED_MOE_FP4_EMULATION", default=False),
++    # FUSED_MOE_FP4_EMULATION block sizes "bf,bd1,bd2,bfc,bd1c,bd2c" (tokens:
++    # bt = btc = min(local tokens, 32)); empty = bf whole intermediate,
++    # bd1/bd2 2048, bfc 512, bd1c/bd2c 1024 (see layers/common/moe.py).
++    "FUSED_MOE_BLOCK_SIZES":
++    lambda: os.getenv("FUSED_MOE_BLOCK_SIZES", ""),
++    # FUSED_MOE_FP4_EMULATION: exchange the per-expert token counts with one
++    # all-to-all (one barrier) instead of the kernel's (N-1)-step ring.
++    "FUSED_MOE_ONESHOT_METADATA":
++    env_bool("FUSED_MOE_ONESHOT_METADATA", default=False),
+     # Enable megablocks for JAX sparse matmul for MoE (Mixture of Experts)
+     # using Unfused weights
+     "USE_UNFUSED_MEGABLOCKS":
+diff --git a/tpu_inference/kernels/fused_moe/v1/kernel.py b/tpu_inference/kernels/fused_moe/v1/kernel.py
+index 7c550a0b8..4b2412ffe 100644
+--- a/tpu_inference/kernels/fused_moe/v1/kernel.py
++++ b/tpu_inference/kernels/fused_moe/v1/kernel.py
+@@ -77,6 +77,11 @@ def swigluoai(gate: jax.Array,
+ def apply_act_fn(acc1, acc3, act_fn):
+     if act_fn == "silu":
+         return jax.nn.silu(acc1) * acc3
++    elif act_fn == "silu_and_mul_with_clamp":
++        # DeepSeek V4 (swiglu_limit 10.0), same as tokamax gmm_v2's fused act.
++        gate = jnp.clip(acc1, max=10.0)
++        up = jnp.clip(acc3, min=-10.0, max=10.0)
++        return jax.nn.silu(gate) * up
+     elif act_fn == "gelu":
+         return jax.nn.gelu(acc1) * acc3
+     elif act_fn == "swigluoai":
+@@ -85,6 +90,58 @@ def apply_act_fn(acc1, acc3, act_fn):
+         raise NotImplementedError(f"Unsupported activation function: {act_fn}")
+ 
+ 
++def decode_fp4_codes(codes: jax.Array, dtype) -> jax.Array:
++    """Exactly decodes tokamax `e2m1_to_codes` uint4 codes to `dtype`.
++
++    Same ops as tokamax gmm_v2 `decode_codes` (v6e fp4 emulation): a code is
++    q = sign * (2 * exponent + mantissa) as int4 and the e2m1 value is
++    2q - clip(q, -6, 6) - clip(q, -4, 4) / 2, exact in bf16.
++    """
++    q = lax.bitcast_convert_type(codes, jnp.int4).astype(jnp.bfloat16)
++    v = (q + q) - (jnp.clip(q, -6, 6) + 0.5 * jnp.clip(q, -4, 4))
++    return v.astype(dtype)
++
++
++def dequant_fp4_block(codes: jax.Array, scale: jax.Array, block: int,
++                      dtype) -> jax.Array:
++    """codes (K, N) uint4, scale (K // block, 1, N) -> (K, N) in `dtype`.
++
++    Dequantizes before the matmul in the same order as tokamax gmm_v2 for
++    quant blocks smaller than the MXU: decode to dtype, cast the scale to
++    dtype, multiply. Power-of-two (e8m0) scales keep this exact.
++    """
++    k, n = codes.shape
++    w = decode_fp4_codes(codes, dtype).reshape(k // block, block, n)
++    s = jnp.broadcast_to(scale.astype(dtype), (k // block, block, n))
++    return (w * s).reshape(k, n)
++
++
++def dedupe_topk(topk_weights: jax.Array, topk_ids: jax.Array,
++                num_experts: int) -> tuple[jax.Array, jax.Array]:
++    """Makes each token's expert ids distinct, for precomputed routing.
++
++    The kernel sizes its all-to-all buffers for at most one row per (token,
++    expert); a router can repeat an expert (e.g. a hash table entry). A repeat
++    adds its weight to the first occurrence (f32) and is re-pointed at an
++    expert the token does not use, with weight 0.
++    """
++    top_k = topk_ids.shape[-1]
++    w = topk_weights.astype(jnp.float32)
++    ids = topk_ids.astype(jnp.int32)
++    cand = jnp.arange(min(2 * top_k, num_experts), dtype=jnp.int32)
++    for j in range(1, top_k):
++        same = ids[:, :j] == ids[:, j:j + 1]  # (T, j)
++        dup = jnp.any(same, axis=-1)
++        first = jnp.argmax(same, axis=-1)
++        add = jnp.where(dup, w[:, j], 0.0)
++        w = w.at[jnp.arange(w.shape[0]), first].add(add)
++        used = jnp.any(ids[:, :, None] == cand[None, None, :], axis=1)
++        free = cand[jnp.argmin(used, axis=-1)]
++        ids = ids.at[:, j].set(jnp.where(dup, free, ids[:, j]))
++        w = w.at[:, j].set(jnp.where(dup, 0.0, w[:, j]))
++    return w, ids
++
++
+ def ref_moe(
+         tokens: jax.Array,  # (num_tokens, hidden_size)
+         w1: jax.Array,  # (num_experts, 2, hidden_size, intermediate_size)
+@@ -248,6 +305,9 @@ def _fused_ep_moe_kernel(
+         scoring_fn: str,
+         subc_quant_w1_sz: int | None = None,
+         subc_quant_w2_sz: int | None = None,
++        fp4_codes: bool = False,
++        precomputed_routing: bool = False,
++        oneshot_metadata: bool = False,
+         # Kernel tuning params.
+         bt: int,  # Block size of local_num_tokens.
+         bf: int,  # Block size of intermediate_size.
+@@ -274,6 +334,11 @@ def _fused_ep_moe_kernel(
+     t_bitwidth = 32 // t_packing
+     assert a2a_g_hbm.dtype == t_dtype
+     assert w1_hbm.dtype == w2_hbm.dtype
++    if fp4_codes:
++        # w1/w2 hold fp4 (e2m1) values as uint4 codes plus per-block scales
++        # along the contracting dim; tiles are dequantized before the matmul.
++        assert w1_hbm.dtype == jnp.uint4
++        assert subc_quant_w1_sz is not None and subc_quant_w2_sz is not None
+ 
+     assert bd1 % bd1c == 0
+     assert bd2 % bd2c == 0
+@@ -291,7 +356,11 @@ def _fused_ep_moe_kernel(
+     bd1c_per_t_packing = bd1c // t_packing
+     bd2c_per_t_packing = bd2c // t_packing
+ 
+-    if subc_quant_w1_sz is not None:
++    if fp4_codes:
++        assert bd1c_per_t_packing % subc_quant_w1_sz == 0
++        assert h_per_t_packing % subc_quant_w1_sz == 0
++        assert bfc % subc_quant_w2_sz == 0
++    elif subc_quant_w1_sz is not None:
+         if subc_quant_w1_sz < hidden_size:
+             assert subc_quant_w1_sz % 256 == 0
+             assert bd1c_per_t_packing == subc_quant_w1_sz
+@@ -301,7 +370,7 @@ def _fused_ep_moe_kernel(
+         else:
+             assert subc_quant_w1_sz == hidden_size
+ 
+-    if subc_quant_w2_sz is not None:
++    if subc_quant_w2_sz is not None and not fp4_codes:
+         if subc_quant_w2_sz < intermediate_size:
+             assert subc_quant_w2_sz % 256 == 0
+             assert bfc == subc_quant_w2_sz
+@@ -390,6 +459,35 @@ def _fused_ep_moe_kernel(
+         expert_starts = jnp.zeros_like(expert_sizes)
+         return top_k_logits_lst, t2e_routing, expert_sizes, expert_starts
+ 
++    def get_precomputed_top_k(routing):
++        """Routing computed outside the kernel (e.g. DeepSeek V4 sqrtsoftplus,
++        score-correction bias or hash routing), packed per token as
++        [weights in lanes 0..top_k) | expert ids in lanes 128..128+top_k)].
++        Returns the same values as get_top_k."""
++        assert routing.shape == (bt, 256), routing.shape
++        routing = routing.astype(jnp.float32)
++        weights = routing[:, :128]
++        ids = routing[:, 128:].astype(jnp.int32)
++        padded_k_shape = (bt, padded_top_k)
++        e_shape = (bt, padded_num_experts)
++        lane_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, 128), 1)
++        padded_k_iota = jax.lax.broadcasted_iota(jnp.int32, padded_k_shape, 1)
++        e_iota = jax.lax.broadcasted_iota(jnp.int32, e_shape, 1)
++        t2e = jnp.zeros(e_shape, dtype=jnp.int32)
++        t2e_routing = jnp.zeros(padded_k_shape, dtype=jnp.int32)
++        top_k_logits_lst = []
++        for k_id in range(top_k):
++            sel = lane_iota == k_id
++            w_k = jnp.sum(jnp.where(sel, weights, 0.0), axis=1, keepdims=True)
++            e_k = jnp.sum(jnp.where(sel, ids, 0), axis=1, keepdims=True)
++            top_k_logits_lst.append(jnp.broadcast_to(w_k, padded_k_shape))
++            e_k = jnp.broadcast_to(e_k, padded_k_shape)
++            t2e_routing = jnp.where(padded_k_iota == k_id, e_k, t2e_routing)
++            t2e += (e_iota == broadcast_minor(e_k, e_shape)).astype(jnp.int32)
++        expert_sizes = jnp.sum(t2e, axis=0, keepdims=True)
++        expert_starts = jnp.zeros_like(expert_sizes)
++        return top_k_logits_lst, t2e_routing, expert_sizes, expert_starts
++
+     def all_reduce_metadata(bt_sem_id, t2e_routing, starts, sizes):
+         send_sem = send_sems.at[0]
+         recv_sem = recv_sems.at[0]
+@@ -419,7 +517,37 @@ def _fused_ep_moe_kernel(
+             reduced_starts = starts
+             row_id = my_id
+             d2e_count_vmem[row_id] = sizes
+-            for i in range(num_devices - 1):
++            if oneshot_metadata:
++                # Every device writes its row straight into every peer's
++                # buffer (num_devices - 1 concurrent sends, one barrier)
++                # instead of the (num_devices - 1)-step ring below with a
++                # barrier per step. Same integer sums.
++                sync_barrier()
++                for peer in range(num_devices):
++
++                    @pl.when(peer != my_id)
++                    def _():
++                        pltpu.make_async_remote_copy(
++                            src_ref=d2e_count_vmem.at[my_id],
++                            dst_ref=d2e_count_vmem.at[my_id],
++                            send_sem=send_sem,
++                            recv_sem=recv_sem,
++                            device_id=get_mesh_device_id(peer),
++                            device_id_type=pl.DeviceIdType.MESH,
++                        ).start()
++
++                if num_devices > 1:
++                    rows = d2e_count_vmem.at[pl.ds(0, num_devices - 1)]
++                    pltpu.make_async_copy(src_ref=rows, dst_ref=rows,
++                                          sem=send_sem).wait()
++                    pltpu.make_async_copy(src_ref=rows, dst_ref=rows,
++                                          sem=recv_sem).wait()
++                counts = d2e_count_vmem[...]  # (num_devices, 1, experts)
++                row_iota = lax.broadcasted_iota(jnp.int32, counts.shape, 0)
++                reduced_sizes = jnp.sum(counts, axis=0)
++                reduced_starts = jnp.sum(jnp.where(row_iota < my_id, counts, 0),
++                                         axis=0)
++            for i in range(0 if oneshot_metadata else num_devices - 1):
+                 sync_barrier()
+                 # TODO(jevinjiang): we can use double buffering to improve AR if needed.
+                 pltpu.async_remote_copy(
+@@ -586,32 +714,46 @@ def _fused_ep_moe_kernel(
+             sem=a2a_gather_sem,
+         ).wait()
+ 
++    # w1/w3 come either stacked, (E, 2, hidden, inter), or as GMM_EP stores
++    # them, (E, hidden, 2 * inter) = [w1 | w3] (scales likewise with their
++    # (E, hidden // block, 1, 2 * inter) layout), so FUSED_MOE can share the
++    # GMM_EP weights.
++    w13_concat = len(w1_hbm.shape) == 3
++
++    def w13_hbm_slice(local_e_id, j, rows, col):
++        if w13_concat:
++            return w1_hbm.at[local_e_id, rows,
++                             pl.ds(j * intermediate_size + col, bf)]
++        return w1_hbm.at[local_e_id, j, rows, pl.ds(col, bf)]
++
++    def w13_scale_hbm_slice(local_e_id, j, rows, col):
++        if w13_concat:
++            return w1_scale_hbm.at[local_e_id, rows,
++                                   pl.ds(0, 1),
++                                   pl.ds(j * intermediate_size + col, bf)]
++        return w1_scale_hbm.at[local_e_id, j, rows,
++                               pl.ds(0, 1),
++                               pl.ds(col, bf)]
++
+     def start_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
+         for p in range(t_packing):
+             offset = p * h_per_t_packing + bd1_id * bd1_per_t_packing
+             pltpu.make_async_copy(
+-                src_ref=w1_hbm.at[
+-                    local_e_id,
+-                    0,
+-                    pl.ds(offset, bd1_per_t_packing),
+-                    pl.ds(bf_id * bf, bf),
+-                ],
++                src_ref=w13_hbm_slice(local_e_id, 0,
++                                      pl.ds(offset, bd1_per_t_packing),
++                                      bf_id * bf),
+                 dst_ref=b_w1_x2_vmem.at[bw1_sem_id, p],
+                 sem=local_sems.at[bw1_sem_id, 1],
+             ).start()
+             if w1_scale_hbm is not None:
+                 assert subc_quant_w1_sz is not None
+                 pltpu.make_async_copy(
+-                    src_ref=w1_scale_hbm.at[
+-                        local_e_id,
+-                        0,
++                    src_ref=w13_scale_hbm_slice(
++                        local_e_id, 0,
+                         pl.ds(
+                             offset // subc_quant_w1_sz,
+                             cdiv(bd1_per_t_packing, subc_quant_w1_sz),
+-                        ),
+-                        pl.ds(0, 1),
+-                        pl.ds(bf_id * bf, bf),
+-                    ],
++                        ), bf_id * bf),
+                     dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, p],
+                     sem=local_sems.at[bw1_sem_id, 1],
+                 ).start()
+@@ -666,30 +808,23 @@ def _fused_ep_moe_kernel(
+         for p in range(t_packing):
+             offset = p * h_per_t_packing + bd3_id * bd1_per_t_packing
+             pltpu.make_async_copy(
+-                src_ref=w1_hbm.at[
+-                    local_e_id,
+-                    1,
+-                    pl.ds(offset, bd1_per_t_packing),
+-                    pl.ds(bf_id * bf, bf),
+-                ],
++                src_ref=w13_hbm_slice(local_e_id, 1,
++                                      pl.ds(offset, bd1_per_t_packing),
++                                      bf_id * bf),
+                 dst_ref=b_w3_x2_vmem.at[bw3_sem_id, p],
+                 sem=local_sems.at[bw3_sem_id, 3],
+             ).start()
+             if w1_scale_hbm is not None:
+                 assert subc_quant_w1_sz is not None
+                 pltpu.make_async_copy(
+-                    src_ref=w1_scale_hbm.at[
+-                        local_e_id,
+-                        1,
++                    src_ref=w13_scale_hbm_slice(
++                        local_e_id, 1,
+                         pl.ds(
+                             offset //
+                             subc_quant_w1_sz,  # 0 for per-channel quantization
+                             cdiv(bd1_per_t_packing, subc_quant_w1_sz
+                                  ),  # 1 for per-channel quantization
+-                        ),
+-                        pl.ds(0, 1),
+-                        pl.ds(bf_id * bf, bf),
+-                    ],
++                        ), bf_id * bf),
+                     dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, p],
+                     sem=local_sems.at[bw3_sem_id, 3],
+                 ).start()
+@@ -808,7 +943,7 @@ def _fused_ep_moe_kernel(
+                 1,
+                 bf,
+             )
+-            if subc_quant_w1_sz < hidden_size:
++            if subc_quant_w1_sz < hidden_size and not fp4_codes:
+                 assert bd1c_per_t_packing == subc_quant_w1_sz
+         if w3_scale_vmem is not None:
+             assert w3_scale_vmem.shape == (
+@@ -817,7 +952,7 @@ def _fused_ep_moe_kernel(
+                 1,
+                 bf,
+             )
+-            if subc_quant_w1_sz < hidden_size:
++            if subc_quant_w1_sz < hidden_size and not fp4_codes:
+                 assert bd1c_per_t_packing == subc_quant_w1_sz
+ 
+         num_loops = cdiv(dyn_sz, btc)
+@@ -839,12 +974,26 @@ def _fused_ep_moe_kernel(
+                                   bd1c_per_t_packing),
+                             pl.ds(bfc_id * bfc, bfc),
+                         )
++                        if fp4_codes:
++                            fp4_scale_slices = (
++                                p_id,
++                                pl.ds(
++                                    bd1c_id * bd1c_per_t_packing //
++                                    subc_quant_w1_sz,
++                                    bd1c_per_t_packing // subc_quant_w1_sz),
++                                pl.ds(0, 1),
++                                pl.ds(bfc_id * bfc, bfc),
++                            )
+                         w1 = w1_vmem[*w_slices]
++                        if fp4_codes:
++                            w1 = dequant_fp4_block(
++                                w1, w1_scale_vmem[fp4_scale_slices],
++                                subc_quant_w1_sz, t_dtype)
+                         acc1 = jnp.dot(t,
+                                        w1,
+                                        preferred_element_type=jnp.float32)
+ 
+-                        if w1_scale_vmem is not None:
++                        if w1_scale_vmem is not None and not fp4_codes:
+                             w1_scale_slices = (
+                                 p_id,
+                                 (bd1c_id * bd1c_per_t_packing) //
+@@ -858,12 +1007,16 @@ def _fused_ep_moe_kernel(
+                             acc1 *= w1_scale
+ 
+                         w3 = w3_vmem[*w_slices]
++                        if fp4_codes:
++                            w3 = dequant_fp4_block(
++                                w3, w3_scale_vmem[fp4_scale_slices],
++                                subc_quant_w1_sz, t_dtype)
+ 
+                         acc3 = jnp.dot(t,
+                                        w3,
+                                        preferred_element_type=jnp.float32)
+ 
+-                        if w3_scale_vmem is not None:
++                        if w3_scale_vmem is not None and not fp4_codes:
+                             w3_scale_slices = (
+                                 p_id,
+                                 (bd1c_id * bd1c_per_t_packing) //
+@@ -926,7 +1079,7 @@ def _fused_ep_moe_kernel(
+                 1,
+                 bd2_per_t_packing,
+             )
+-            if subc_quant_w2_sz < intermediate_size:
++            if subc_quant_w2_sz < intermediate_size and not fp4_codes:
+                 assert bfc == subc_quant_w2_sz
+ 
+         num_loops = cdiv(dyn_sz, btc)
+@@ -962,10 +1115,24 @@ def _fused_ep_moe_kernel(
+                             pl.ds(bd2c_id *
+                                   bd2c_per_t_packing, bd2c_per_t_packing),
+                         ]
++                        if fp4_codes:
++                            # As GMM_EP: the activation is rounded to the
++                            # token dtype (gmm1 output) before the down proj.
++                            act = act.astype(t_dtype)
++                            w2 = dequant_fp4_block(
++                                w2,
++                                w2_scale_vmem[
++                                    p_id,
++                                    pl.ds(bfc_id * bfc // subc_quant_w2_sz,
++                                          bfc // subc_quant_w2_sz),
++                                    pl.ds(0, 1),
++                                    pl.ds(bd2c_id * bd2c_per_t_packing,
++                                          bd2c_per_t_packing),
++                                ], subc_quant_w2_sz, t_dtype)
+                         acc = jnp.dot(act,
+                                       w2,
+                                       preferred_element_type=jnp.float32)
+-                        if w2_scale_vmem is not None:
++                        if w2_scale_vmem is not None and not fp4_codes:
+                             w2_scale_slices = (
+                                 p_id,
+                                 (bfc_id * bfc) // subc_quant_w2_sz,
+@@ -977,6 +1144,10 @@ def _fused_ep_moe_kernel(
+                                 w2_scale_vmem[*w2_scale_slices], acc.shape)
+                             acc *= w2_scale
+                         res += acc
++                    if fp4_codes:
++                        # Round to nearest (GMM_EP rounds its f32 gmm2
++                        # accumulator); the packing below truncates.
++                        res = res.astype(t_dtype).astype(jnp.float32)
+                     res = pltpu.bitcast(res, jnp.uint32)
+                     if t_packing == 2:
+                         res = res >> 16 << (16 * p_id)
+@@ -1137,9 +1308,14 @@ def _fused_ep_moe_kernel(
+         wait_fetch_b_gating(bt_id)
+ 
+         b_gating = b_gating_x2_vmem[bt_sem_id]
+-        b_gating_score = apply_scoring_fn(scoring_fn, b_gating)
+-        top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
+-            b_gating_score, top_k, renormalize_topk_logits)
++        if precomputed_routing:
++            (top_k_logits_lst, t2e_routing, expert_sizes,
++             expert_starts) = get_precomputed_top_k(b_gating)
++        else:
++            b_gating_score = apply_scoring_fn(scoring_fn, b_gating)
++            (top_k_logits_lst, t2e_routing, expert_sizes,
++             expert_starts) = get_top_k(b_gating_score, top_k,
++                                        renormalize_topk_logits)
+ 
+         all_reduce_metadata(bt_sem_id, t2e_routing, expert_starts,
+                             expert_sizes)
+@@ -1229,6 +1405,8 @@ def _fused_ep_moe_kernel(
+         "scoring_fn",
+         "subc_quant_w1_sz",
+         "subc_quant_w2_sz",
++        "fp4_codes",
++        "oneshot_metadata",
+         "bt",
+         "bf",
+         "bd1",
+@@ -1245,9 +1423,13 @@ def fused_ep_moe(
+     tokens: jax.Array,  # (num_tokens, hidden_size)
+     w1: jax.Array,  # (num_experts, 2, hidden_size, intermediate_size)
+     w2: jax.Array,  # (num_experts, intermediate_size, hidden_size)
+-    gating_output: jax.Array,  # (num_tokens, num_experts)
++    gating_output: jax.Array | None,  # (num_tokens, num_experts)
+     top_k: int,
+     *,
++    topk_weights: jax.Array | None = None,  # (num_tokens, top_k)
++    topk_ids: jax.Array | None = None,  # I32(num_tokens, top_k)
++    fp4_codes: bool = False,
++    oneshot_metadata: bool = False,
+     renormalize_topk_logits: bool = False,
+     act_fn: str = "silu",
+     scoring_fn: str = "softmax",
+@@ -1289,7 +1471,13 @@ def fused_ep_moe(
+     num_tokens, hidden_size = tokens.shape
+     num_experts, intermediate_size, _ = w2.shape
+ 
+-    if w1.shape != (num_experts, 2, hidden_size, intermediate_size):
++    w13_concat = w1.ndim == 3  # GMM_EP layout (E, hidden, 2 * inter)
++    if w13_concat:
++        if w1.shape != (num_experts, hidden_size, 2 * intermediate_size):
++            raise ValueError(
++                f"Expected {w1.shape=} to be"
++                f" {(num_experts, hidden_size, 2 * intermediate_size)}.")
++    elif w1.shape != (num_experts, 2, hidden_size, intermediate_size):
+         raise ValueError(
+             f"Expected {w1.shape=} to be"
+             f" {(num_experts, 2, hidden_size, intermediate_size)}.")
+@@ -1298,11 +1486,34 @@ def fused_ep_moe(
+         raise ValueError(f"Expected {w2.shape=} to be"
+                          f" {(num_experts, intermediate_size, hidden_size)}.")
+ 
+-    if gating_output.shape != (num_tokens, num_experts):
++    # Precomputed routing (topk_weights/topk_ids) replaces the in-kernel
++    # scoring + top-k, for routers it does not implement (DeepSeek V4:
++    # sqrtsoftplus, score-correction bias, hash routing). The weights are
++    # applied as given (no renormalization in the kernel).
++    precomputed_routing = topk_ids is not None
++    if precomputed_routing:
++        if topk_weights is None or topk_ids.shape != (num_tokens, top_k):
++            raise ValueError(
++                f"Expected topk_weights and {topk_ids.shape=} to be"
++                f" {(num_tokens, top_k)}.")
++        if topk_weights.shape != topk_ids.shape:
++            raise ValueError(f"{topk_weights.shape=} != {topk_ids.shape=}")
++        if top_k > 128:
++            raise ValueError(f"Precomputed routing supports {top_k=} <= 128.")
++    elif gating_output.shape != (num_tokens, num_experts):
+         raise ValueError(
+             f"Expected {gating_output.shape=} to be {(num_tokens, num_experts)}."
+         )
+ 
++    if fp4_codes:
++        # fp4 (e2m1) expert weights stored as tokamax gmm_v2 uint4 codes
++        # (e2m1_to_codes), for TPUs whose Mosaic has no f4 vectors (v6e).
++        if w1.dtype != jnp.uint4 or w2.dtype != jnp.uint4:
++            raise ValueError(
++                f"fp4_codes expects uint4 weights, got {w1.dtype}, {w2.dtype}.")
++        if w1_scale is None or w2_scale is None:
++            raise ValueError("fp4_codes requires w1_scale and w2_scale.")
++
+     if not (0 < top_k <= num_experts):
+         raise ValueError(
+             f"Expected {top_k=} to be in range (0, {num_experts=}].")
+@@ -1358,7 +1569,21 @@ def fused_ep_moe(
+         raise ValueError(
+             f"Expected {local_num_tokens=} to be aligned to {bt=}.")
+ 
+-    if subc_quant_w1_sz is not None:
++    if fp4_codes:
++        # Tiles are dequantized before the matmul, so the quant blocks only
++        # need to divide the compute blocks.
++        if (bd1c // t_packing) % subc_quant_w1_sz != 0:
++            raise ValueError(
++                f"Expected {bd1c=} // {t_packing=} to be aligned to"
++                f" {subc_quant_w1_sz=}.")
++        if bfc % subc_quant_w2_sz != 0:
++            raise ValueError(
++                f"Expected {bfc=} to be aligned to {subc_quant_w2_sz=}.")
++        if (hidden_size // t_packing) % subc_quant_w1_sz != 0:
++            raise ValueError(
++                f"Expected {hidden_size=} // {t_packing=} to be aligned to"
++                f" {subc_quant_w1_sz=}.")
++    elif subc_quant_w1_sz is not None:
+         if subc_quant_w1_sz <= 0:
+             raise ValueError(
+                 f"Expected {subc_quant_w1_sz=} to be non-negative.")
+@@ -1375,7 +1600,7 @@ def fused_ep_moe(
+         if subc_quant_w1_sz < hidden_size:
+             bd1c = subc_quant_w1_sz * t_packing
+ 
+-    if subc_quant_w2_sz is not None:
++    if subc_quant_w2_sz is not None and not fp4_codes:
+         if subc_quant_w2_sz <= 0:
+             raise ValueError(
+                 f"Expected {subc_quant_w2_sz=} to be non-negative.")
+@@ -1417,13 +1642,18 @@ def fused_ep_moe(
+     # checkpoint offline or reshape right after weight loading.
+     if w1_scale is not None:
+         assert subc_quant_w1_sz is not None
+-        expected_w1_scale_shape = (
++        expected_w1_scale_shape = ((
++            num_experts,
++            hidden_size // subc_quant_w1_sz,
++            1,
++            2 * intermediate_size,
++        ) if w13_concat else (
+             num_experts,
+             2,
+             hidden_size // subc_quant_w1_sz,
+             1,
+             intermediate_size,
+-        )
++        ))
+         if w1_scale.shape != expected_w1_scale_shape:
+             raise ValueError(
+                 f"Expected {w1_scale.shape=} to be {expected_w1_scale_shape}.")
+@@ -1461,7 +1691,17 @@ def fused_ep_moe(
+             b2 = b2.astype(jnp.float32)
+ 
+     # Prepare inputs for the kernel.
+-    if padded_num_experts != gating_output.shape[-1]:
++    if precomputed_routing:
++        topk_weights, topk_ids = dedupe_topk(topk_weights, topk_ids,
++                                             num_experts)
++        # One f32 row per token: weights in lanes [0, top_k), expert ids in
++        # lanes [128, 128 + top_k). Ids < 2**24 are exact in f32.
++        gating_output = jnp.zeros((num_tokens, 256), jnp.float32)
++        gating_output = gating_output.at[:, :top_k].set(
++            topk_weights.astype(jnp.float32))
++        gating_output = gating_output.at[:, 128:128 + top_k].set(
++            topk_ids.astype(jnp.float32))
++    elif padded_num_experts != gating_output.shape[-1]:
+         gating_output = jnp.pad(
+             gating_output,
+             ((0, 0), (0, padded_num_experts - gating_output.shape[-1])),
+@@ -1472,7 +1712,8 @@ def fused_ep_moe(
+ 
+     hbm_block_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+     renorm_str = "-renorm_k" if renormalize_topk_logits else ""
+-    scope_name = f"fused-moe-k_{top_k}{renorm_str}-bt_{bt}_{btc}-bf_{bf}_{bfc}-bd1_{bd1}_{bd1c}-bd2_{bd2}_{bd2c}"
++    fp4_str = "-fp4" if fp4_codes else ""
++    scope_name = f"fused-moe{fp4_str}-k_{top_k}{renorm_str}-bt_{bt}_{btc}-bf_{bf}_{bfc}-bd1_{bd1}_{bd1c}-bd2_{bd2}_{bd2c}"
+     fused_moe = pl.pallas_call(
+         functools.partial(
+             _fused_ep_moe_kernel,
+@@ -1483,6 +1724,9 @@ def fused_ep_moe(
+             scoring_fn=scoring_fn,
+             subc_quant_w1_sz=subc_quant_w1_sz,
+             subc_quant_w2_sz=subc_quant_w2_sz,
++            fp4_codes=fp4_codes,
++            precomputed_routing=precomputed_routing,
++            oneshot_metadata=oneshot_metadata,
+             bt=bt,
+             bf=bf,
+             bd1=bd1,
+@@ -1545,7 +1789,8 @@ def fused_ep_moe(
+                 pltpu.VMEM((top_k, bt, t_packing, hidden_size // t_packing),
+                            t_dtype),
+                 # b_gating_x2_vmem
+-                pltpu.VMEM((2, bt, padded_num_experts), t_dtype),
++                (pltpu.VMEM((2, bt, 256), jnp.float32) if precomputed_routing
++                 else pltpu.VMEM((2, bt, padded_num_experts), t_dtype)),
+                 # b_output_x2_vmem
+                 pltpu.VMEM((2, bt, hidden_size), t_dtype),
+                 # b_w1_x2_vmem
+diff --git a/tpu_inference/layers/common/moe.py b/tpu_inference/layers/common/moe.py
+index 68613f883..62d956a16 100644
+--- a/tpu_inference/layers/common/moe.py
++++ b/tpu_inference/layers/common/moe.py
+@@ -71,6 +71,105 @@ class MoEBackend(Enum):
+         return {cls.FUSED_MOE, cls.GMM_EP, cls.GMM_TP}
+ 
+ 
++def _fused_moe_fp4_routing(gating_output: jax.Array, top_k: int,
++                           renormalize: bool, scoring_fn: str,
++                           dtype: jnp.dtype, extra: dict):
++    """Top-k routing exactly as fused_moe_func computes it for the GMM path
++    (scoring function, hash routing, correction bias, renormalization,
++    padding-to-expert-0), for fused_ep_moe's precomputed-routing input."""
++    from tpu_inference.layers.common.fused_moe_gmm import apply_scoring_fn
++    hash_ids = extra.pop("hash_based_topk_indices", None)
++    bias = extra.pop("e_score_correction_bias", None)
++    num_valid_tokens = extra.pop("num_valid_tokens", None)
++    num_tokens = gating_output.shape[0]
++    topk_weights = apply_scoring_fn(scoring_fn, gating_output)
++    if hash_ids is not None:
++        topk_indices = hash_ids
++        topk_weights = jnp.take_along_axis(topk_weights, topk_indices, axis=-1)
++    elif envs.MOE_APPROX_TOPK:
++        topk_weights, topk_indices = jax.lax.approx_max_k(
++            topk_weights,
++            k=top_k,
++            recall_target=envs.MOE_APPROX_TOPK_RECALL_TARGET)
++    elif bias is not None:
++        _, topk_indices = jax.lax.top_k(topk_weights + bias[None, :], k=top_k)
++        topk_weights = jnp.take_along_axis(topk_weights, topk_indices, axis=-1)
++    else:
++        topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=top_k)
++    if renormalize:
++        topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
++    if num_valid_tokens is not None:
++        token_valid = (jnp.arange(num_tokens) < num_valid_tokens)[:, None]
++        topk_indices = jnp.where(token_valid, topk_indices, 0)
++        topk_weights = jnp.where(token_valid, topk_weights, 0.0)
++    return topk_weights.astype(dtype), topk_indices.astype(jnp.int32)
++
++
++def _fused_moe_fp4_apply(layer, x: jax.Array, gating_output: jax.Array,
++                         weights, mesh: Mesh, activation: str,
++                         extra: dict) -> jax.Array:
++    """FUSED_MOE with fp4 expert weights held as uint4 codes (v6e emulation).
++
++    Accepts the stacked FUSED_MOE weight layout or the GMM_EP one. The kernel
++    needs a 2D (data=1, ep) mesh: a view of the same devices in the same order
++    (valid when only the expert-parallel axes are larger than 1).
++    """
++    from tpu_inference.layers.common.sharding import ShardingAxisName
++    from tpu_inference.utils import get_mesh_shape_product
++    ep_size = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
++    if ep_size != mesh.devices.size:
++        raise NotImplementedError(
++            "FUSED_MOE_FP4_EMULATION needs every mesh device on the expert "
++            f"axes, got ep={ep_size} of {mesh.devices.size} devices.")
++    extra.pop("ep_axis_name", None)
++    ep_mesh = Mesh(mesh.devices.reshape(1, -1), ("data", "model"))
++    topk_weights, topk_ids = _fused_moe_fp4_routing(gating_output,
++                                                    layer.top_k,
++                                                    layer.renormalize,
++                                                    layer.scoring_func,
++                                                    x.dtype, extra)
++    w1, w2 = weights.w13_weight, weights.w2_weight
++    hidden_size = w2.shape[-1]
++    qb1 = hidden_size // weights.w13_weight_scale.shape[-3]
++    qb2 = w2.shape[-2] // weights.w2_weight_scale.shape[-3]
++    intermediate_size = w2.shape[-2]
++    if envs.FUSED_MOE_BLOCK_SIZES:
++        bf, bd1, bd2, bfc, bd1c, bd2c = (
++            int(v) for v in envs.FUSED_MOE_BLOCK_SIZES.split(","))
++    else:
++        # bf = whole intermediate: the down projection then accumulates in
++        # f32 and rounds once, as the GMM path does.
++        bf, bd1, bd2 = intermediate_size, min(hidden_size, 2048), min(
++            hidden_size, 2048)
++        bfc, bd1c, bd2c = min(bf, 512), min(bd1, 1024), min(bd2, 1024)
++    bt = min(x.shape[0] // ep_size, 32)
++    blocks = dict(bt=bt, btc=bt, bf=bf, bd1=bd1, bd2=bd2, bfc=bfc, bd1c=bd1c,
++                  bd2c=bd2c)
++    actual_hidden_size = x.shape[-1]
++    x = jnp.pad(x, ((0, 0), (0, hidden_size - actual_hidden_size)))
++    return fused_ep_moe(
++        mesh=ep_mesh,
++        tokens=x,
++        w1=w1,
++        w2=w2,
++        gating_output=None,
++        top_k=layer.top_k,
++        topk_weights=topk_weights,
++        topk_ids=topk_ids,
++        fp4_codes=True,
++        oneshot_metadata=envs.FUSED_MOE_ONESHOT_METADATA,
++        act_fn=activation,
++        subc_quant_w1_sz=qb1,
++        subc_quant_w2_sz=qb2,
++        w1_scale=weights.w13_weight_scale,
++        w2_scale=weights.w2_weight_scale,
++        b1=weights.w13_bias,
++        b2=weights.w2_bias,
++        ep_axis_name="model",
++        **blocks,
++    )[:, :actual_hidden_size]
++
++
+ def moe_apply(
+     layer: Union[RoutedExperts, JaxRoutedExperts, JaxMoE],
+     x: jax.Array,
+@@ -103,6 +202,12 @@ def moe_apply(
+             if swiglu_limit is not None and swiglu_limit > 0:
+                 activation = "silu_and_mul_with_clamp"
+         match moe_backend:
++            case MoEBackend.FUSED_MOE if (envs.FUSED_MOE_FP4_EMULATION and
++                                          weights.w13_weight.dtype
++                                          == jnp.uint4):
++                output = _fused_moe_fp4_apply(layer, x, gating_output,
++                                              weights, mesh, activation,
++                                              extra_backend_kwargs)
+             case MoEBackend.FUSED_MOE:
+                 subc_quant_w1_sz = None
+                 subc_quant_w2_sz = None
+diff --git a/tpu_inference/layers/common/process_weights/moe_weights.py b/tpu_inference/layers/common/process_weights/moe_weights.py
+index 421370f91..09ff569fb 100644
+--- a/tpu_inference/layers/common/process_weights/moe_weights.py
++++ b/tpu_inference/layers/common/process_weights/moe_weights.py
+@@ -671,8 +671,10 @@ def shard_moe_weights(
+             layout = getattr(weight_layouts, key)
+             sharding = getattr(weight_shardings, key)
+             weight = general_device_put(weight, sharding, layout=layout)
+-            if (key in ("w13_weight", "w2_weight") and moe_backend
+-                    in (MoEBackend.GMM_TP, MoEBackend.GMM_EP)):
++            if (key in ("w13_weight", "w2_weight") and
++                (moe_backend in (MoEBackend.GMM_TP, MoEBackend.GMM_EP) or
++                 (moe_backend == MoEBackend.FUSED_MOE
++                  and envs.FUSED_MOE_FP4_EMULATION))):
+                 weight = fp4_weight_to_codes(weight)
+             setattr(weights, key, weight)
+     return weights
+-- 
+2.34.1
+

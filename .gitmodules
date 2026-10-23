@@ -1,0 +1,6 @@
+[submodule "vllm"]
+	path = vllm
+	url = https://github.com/vllm-project/vllm.git
+[submodule "tpu-inference"]
+	path = tpu-inference
+	url = https://github.com/vllm-project/tpu-inference.git

@@ -1,0 +1,565 @@
+diff --git a/tests/core/test_dp_scheduler.py b/tests/core/test_dp_scheduler.py
+index 655fb28..3f8ccae 100644
+--- a/tests/core/test_dp_scheduler.py
++++ b/tests/core/test_dp_scheduler.py
+@@ -28,7 +28,7 @@ from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
+ from vllm.v1.request import Request
+ 
+ from tpu_inference.core.sched.dp_scheduler import (
+-    DPScheduler, DPSchedulerOutput, SchedulerCommand,
++    DPScheduler, DPSchedulerOutput, SchedulerCommand, _init_accepts,
+     update_vllm_config_for_dp_scheduler)
+ 
+ 
+@@ -1356,3 +1356,19 @@ class TestUpdateVllmConfigForDPScheduler:
+ 
+ if __name__ == "__main__":
+     pytest.main([__file__, "-v"])
++
++
++def test_init_accepts_follows_kwargs_forwarding_subclasses():
++    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
++
++    # AsyncScheduler.__init__(*args, **kwargs) forwards to Scheduler.
++    assert _init_accepts(AsyncScheduler, "hash_block_size")
++    assert _init_accepts(Scheduler, "hash_block_size")
++    assert not _init_accepts(Scheduler, "no_such_argument")
++
++    class Strict:
++
++        def __init__(self, block_size):
++            pass
++
++    assert not _init_accepts(Strict, "hash_block_size")
+diff --git a/tests/kernels/deepseek_v4/fp8_fake_quant_test.py b/tests/kernels/deepseek_v4/fp8_fake_quant_test.py
+new file mode 100644
+index 0000000..034a78e
+--- /dev/null
++++ b/tests/kernels/deepseek_v4/fp8_fake_quant_test.py
+@@ -0,0 +1,62 @@
++# Copyright 2025 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""fp8_fake_quant vs DeepSeek-V4 reference act_quant(x, 64, "ue8m0", inplace)."""
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++from absl.testing import absltest
++
++from tpu_inference.kernels.experimental.deepseek_v4.compress_and_store.compute import \
++    fp8_fake_quant
++
++
++def _reference(x: np.ndarray, block: int, nope: int) -> np.ndarray:
++    # DeepSeek-V4 inference/kernel.py act_quant_kernel with round_scale and
++    # inplace=True, applied to x[..., :nope].
++    out = x.astype(np.float32).copy()
++    xb = out[..., :nope].reshape(*x.shape[:-1], nope // block, block)
++    amax = np.maximum(np.abs(xb).max(-1, keepdims=True), 1e-4)
++    scale = np.exp2(np.ceil(np.log2(amax / 448.0))).astype(np.float32)
++    q = np.clip(xb / scale, -448, 448)
++    q = np.asarray(jnp.asarray(q).astype(jnp.float8_e4m3fn).astype(jnp.float32))
++    out[..., :nope] = (q * scale).reshape(*x.shape[:-1], nope)
++    return out
++
++
++class Fp8FakeQuantTest(absltest.TestCase):
++
++    def test_flat_matches_reference(self):
++        x = jax.random.normal(jax.random.key(0), (37, 512), jnp.float32) * 3
++        x = x.at[3].set(0.0)  # all-zero row exercises the 1e-4 amax floor
++        x = x.astype(jnp.bfloat16)
++        got = fp8_fake_quant(x, 64, 448)
++        want = _reference(np.asarray(x.astype(jnp.float32)), 64, 448)
++        np.testing.assert_array_equal(np.asarray(got.astype(jnp.float32)),
++                                      np.asarray(jnp.asarray(want).astype(
++                                          jnp.bfloat16).astype(jnp.float32)))
++        # RoPE channels are untouched.
++        np.testing.assert_array_equal(np.asarray(got[:, 448:]),
++                                      np.asarray(x[:, 448:]))
++
++    def test_tiled_layout_matches_flat(self):
++        # Compressor kernel layout: (tokens, head_tiles, 128) f32.
++        x = jax.random.normal(jax.random.key(1), (8, 512), jnp.float32)
++        flat = fp8_fake_quant(x, 64, 448)
++        tiled = fp8_fake_quant(x.reshape(8, 4, 128), 64, 448).reshape(8, 512)
++        np.testing.assert_array_equal(np.asarray(flat), np.asarray(tiled))
++
++
++if __name__ == "__main__":
++    absltest.main()
+diff --git a/tests/layers/common/test_quantization.py b/tests/layers/common/test_quantization.py
+index ff59a35..a3f47d7 100644
+--- a/tests/layers/common/test_quantization.py
++++ b/tests/layers/common/test_quantization.py
+@@ -27,6 +27,55 @@ from tpu_inference.layers.common.quantization import (
+ @jtu.with_config(jax_numpy_dtype_promotion="standard")
+ class QuantizationTest(jtu.JaxTestCase):
+ 
++    def test_power_of_two_scale_requantizes_ue8m0_fp8_blocks_exactly(self):
++        # DeepSeek-V4 style fp8 weight: 128x128 blocks with ue8m0 scales,
++        # requantized to 1x128 blocks along the contracting dim.
++        k1, k2 = jax.random.split(jax.random.key(1))
++        shape = (512, 384)  # [in, out]
++        w = jax.random.normal(k1, shape, jnp.float32).astype(
++            jnp.float8_e4m3fn)
++        exps = jax.random.randint(k2, (4, 3), -12, 0)
++        scale = jnp.ldexp(jnp.ones(exps.shape, jnp.float32), exps)
++        original = dequantize_tensor(w, scale, (0, 1), jnp.float32,
++                                     (128, 128))
++
++        tensor_q, new_scale = quantize_tensor(jnp.float8_e4m3fn,
++                                              original,
++                                              axis=0,
++                                              block_size=128,
++                                              power_of_two_scale=True)
++        roundtrip = dequantize_tensor(tensor_q, new_scale, 0, jnp.float32,
++                                      (128, ))
++        self.assertArraysEqual(roundtrip, original)
++
++    def test_power_of_two_scale_requantizes_mxfp4_exactly(self):
++        # Random e2m1 codes + e8m0 exponents, as stored in an MXFP4 checkpoint.
++        k1, k2 = jax.random.split(jax.random.key(0))
++        shape = (4, 64, 256)
++        codes = jax.random.randint(k1, shape, 0, 16, jnp.uint8)
++        values = jax.lax.bitcast_convert_type(
++            codes.astype(jnp.uint4), jnp.float4_e2m1fn).astype(jnp.float32)
++        exps = jax.random.randint(k2, shape[:-1] + (shape[-1] // 32, ), -20,
++                                  5)
++        scale = jnp.ldexp(jnp.ones(exps.shape, jnp.float32), exps)
++        original = (values.reshape(*shape[:-1], -1, 32) *
++                    scale[..., None]).reshape(shape)
++
++        tensor_q, new_scale = quantize_tensor(jnp.float4_e2m1fn,
++                                              original,
++                                              -1,
++                                              32,
++                                              power_of_two_scale=True)
++        roundtrip = dequantize_tensor(tensor_q, new_scale, -1, jnp.float32,
++                                      (32, ))
++        self.assertArraysEqual(roundtrip, original)
++
++        # The default absmax scale is not exact on the same input.
++        tensor_q, new_scale = quantize_tensor(jnp.float4_e2m1fn, original, -1,
++                                              32)
++        lossy = dequantize_tensor(tensor_q, new_scale, -1, jnp.float32, (32, ))
++        self.assertFalse(bool(jnp.all(lossy == original)))
++
+     @parameterized.product(axis=[-1, 0, (0, 1)])
+     def test_mxfp4_quantization(self, axis):
+         if not jtu.is_device_tpu_at_least(version=7):
+diff --git a/tpu_inference/core/sched/dp_scheduler.py b/tpu_inference/core/sched/dp_scheduler.py
+index 81dd5e1..3cdce8c 100644
+--- a/tpu_inference/core/sched/dp_scheduler.py
++++ b/tpu_inference/core/sched/dp_scheduler.py
+@@ -142,6 +142,26 @@ def _disable_cloudpickle():
+     multiprocessing.reduction.ForkingPickler.loads = _original_loads
+ 
+ 
++def _init_accepts(cls: type, name: str) -> bool:
++    """Whether ``cls(...)`` accepts keyword ``name``.
++
++    Follows the MRO through constructors that forward ``*args, **kwargs``
++    (e.g. vLLM's ``AsyncScheduler``), whose own signature does not name it.
++    """
++    import inspect
++    for klass in cls.__mro__:
++        init = klass.__dict__.get("__init__")
++        if init is None:
++            continue
++        params = inspect.signature(init).parameters
++        if name in params:
++            return True
++        if not any(p.kind is inspect.Parameter.VAR_KEYWORD
++                   for p in params.values()):
++            return False
++    return False
++
++
+ def _scheduler_worker_process(
+     rank: int,
+     input_conn: Connection,
+@@ -172,8 +192,6 @@ def _scheduler_worker_process(
+             cache_config.mamba_num_blocks = mamba_num_blocks
+ 
+     # Initialize the scheduler in this process
+-    import inspect
+-    sig = inspect.signature(original_scheduler_cls)
+     scheduler_kwargs = {
+         "vllm_config": vllm_config,
+         "kv_cache_config": kv_cache_config,
+@@ -183,7 +201,10 @@ def _scheduler_worker_process(
+         "include_finished_set": include_finished_set,
+         "log_stats": log_stats,
+     }
+-    if "hash_block_size" in sig.parameters:
++    # Hybrid models (several KV cache groups) hash at a granularity finer
++    # than the scheduler block size; dropping this falls back to block_size
++    # and the hybrid coordinator rejects it when prefix caching is on.
++    if _init_accepts(original_scheduler_cls, "hash_block_size"):
+         scheduler_kwargs["hash_block_size"] = hash_block_size
+ 
+     import os
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index fab6070..a622a86 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -110,6 +110,8 @@ def gmm_wrapper(lhs,
+                 group_offset,
+                 fuse_act=None,
+                 preferred_element_type=None):
++    # uint4 expert weights are fp4 (e2m1) codes, see fp4_weight_to_codes.
++    extra = {"rhs_fp4_codes": True} if rhs.dtype == jnp.uint4 else {}
+     gmm_res = gmm_v2(
+         lhs=lhs,
+         rhs=rhs,
+@@ -121,6 +123,7 @@ def gmm_wrapper(lhs,
+         zero_initialize=False,
+         fuse_act=fuse_act,
+         preferred_element_type=preferred_element_type,
++        **extra,
+     )
+     return gmm_res
+ 
+diff --git a/tpu_inference/layers/common/process_weights/moe_weights.py b/tpu_inference/layers/common/process_weights/moe_weights.py
+index 85753d2..421370f 100644
+--- a/tpu_inference/layers/common/process_weights/moe_weights.py
++++ b/tpu_inference/layers/common/process_weights/moe_weights.py
+@@ -70,6 +70,7 @@ def quantize_moe_weights(
+     dtype: jnp.dtype,
+     block_size: int | None,
+     w13_interleave: bool = False,
++    power_of_two_scale: bool = False,
+ ) -> FusedMoEWeights:
+     """Quantize fused moe weights into a given dtype and block size.
+ 
+@@ -83,6 +84,7 @@ def quantize_moe_weights(
+         w13_interleave: used when loaded w13_weight is stored in interleaved
+             pattern where even index element is w1 and odd index element is w3
+             we uninterleave so that first half is w1 and second half is w3.
++        power_of_two_scale: see quantize_tensor.
+ 
+     Returns:
+         Quantized fused moe weights that may have also been padded.
+@@ -142,10 +144,12 @@ def quantize_moe_weights(
+     if (w2_bias := weights.w2_bias) is not None:
+         weights.w2_bias = jnp.pad(w2_bias, w2_pad_widths[:2])
+ 
+-    w13_weight, w13_weight_scale = quantize_tensor(dtype, w13_weight, 2,
+-                                                   w13_block_size)
+-    w2_weight, w2_weight_scale = quantize_tensor(dtype, w2_weight, 2,
+-                                                 w2_block_size)
++    w13_weight, w13_weight_scale = quantize_tensor(
++        dtype, w13_weight, 2, w13_block_size,
++        power_of_two_scale=power_of_two_scale)
++    w2_weight, w2_weight_scale = quantize_tensor(
++        dtype, w2_weight, 2, w2_block_size,
++        power_of_two_scale=power_of_two_scale)
+ 
+     weights.w13_weight = w13_weight
+     weights.w13_weight_scale = w13_weight_scale
+@@ -607,6 +611,32 @@ def _get_moe_weight_shardings(
+             )
+ 
+ 
++def fp4_weight_to_codes(weight: jax.Array) -> jax.Array:
++    """Store an fp4 expert weight as gmm_v2's uint4 codes if the chip needs it.
++
++    On TPUs whose Mosaic cannot materialize f4 (v6e and older) tokamax gmm_v2
++    decodes fp4 in-kernel from uint4 codes. Handing it float4_e2m1fn weights
++    makes it re-encode all experts' weights on every call, a full HBM pass
++    (~30 ms per DeepSeek-V4 layer per step on v6e, ~90% of decode time).
++    Encode once here instead; gmm_wrapper passes ``rhs_fp4_codes`` for uint4
++    weights. The encoding is exact.
++    """
++    if weight.dtype != jnp.float4_e2m1fn:
++        return weight
++    device = next(iter(weight.devices()))
++    if device.platform != "tpu":
++        return weight
++    from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import (
++        e2m1_to_codes, needs_fp4_emulation)
++
++    # Weight loading may run with a CPU default device; ask about the chip
++    # the weight lives on.
++    with jax.default_device(device):
++        if not needs_fp4_emulation(weight.dtype):
++            return weight
++    return jax.jit(e2m1_to_codes, donate_argnums=0)(weight)
++
++
+ def shard_moe_weights(
+     weights: FusedMoEWeights,
+     moe_backend: MoEBackend,
+@@ -641,6 +671,9 @@ def shard_moe_weights(
+             layout = getattr(weight_layouts, key)
+             sharding = getattr(weight_shardings, key)
+             weight = general_device_put(weight, sharding, layout=layout)
++            if (key in ("w13_weight", "w2_weight") and moe_backend
++                    in (MoEBackend.GMM_TP, MoEBackend.GMM_EP)):
++                weight = fp4_weight_to_codes(weight)
+             setattr(weights, key, weight)
+     return weights
+ 
+diff --git a/tpu_inference/layers/common/quantization/__init__.py b/tpu_inference/layers/common/quantization/__init__.py
+index d01687a..386838c 100644
+--- a/tpu_inference/layers/common/quantization/__init__.py
++++ b/tpu_inference/layers/common/quantization/__init__.py
+@@ -230,6 +230,7 @@ def quantize_tensor(
+     tensor: jax.Array,
+     axis: int | tuple | None = -1,
+     block_size: int | None = None,
++    power_of_two_scale: bool = False,
+ ) -> tuple[jax.Array, jax.Array]:
+     """Quantize tensor.
+ 
+@@ -238,6 +239,9 @@ def quantize_tensor(
+         tensor: Unquantized tensor
+         axis: Axis to perform quantization. None denotes per-tensor.
+         block_size: Specify block quantization size.
++        power_of_two_scale: Round scales up to a power of two. Re-quantizing
++            MX-format data (e.g. MXFP4: e2m1 + e8m0 per 32) to the same block
++            size this way reproduces it exactly.
+ 
+     Returns:
+         Tensor quantized to dtype.
+@@ -286,6 +290,13 @@ def quantize_tensor(
+ 
+     abs_max = jnp.max(jnp.abs(tensor), axis=axis, keepdims=True)
+     scale = abs_max / dtype_max
++    if power_of_two_scale:
++        # 2^ceil(log2(scale)), computed exactly via frexp (mant in [0.5, 1)).
++        mant, exp = jnp.frexp(scale)
++        scale = jnp.where(scale > 0,
++                          jnp.ldexp(jnp.ones_like(scale),
++                                    jnp.where(mant == 0.5, exp - 1, exp)),
++                          scale)
+ 
+     # If scale=0, scale_inv=1/scale=1/0=NaN. Since NaN will cause numeric error
+     # during inference, we convert them to inf.
+diff --git a/tpu_inference/layers/common/quantization/configs.py b/tpu_inference/layers/common/quantization/configs.py
+index 661ad3f..6c48c86 100644
+--- a/tpu_inference/layers/common/quantization/configs.py
++++ b/tpu_inference/layers/common/quantization/configs.py
+@@ -53,3 +53,7 @@ class QuantLinearConfig:
+         self.enable_quantized_matmul_kernel = envs.ENABLE_QUANTIZED_MATMUL_KERNEL
+         self.requant_block_size = envs.REQUANTIZE_BLOCK_SIZE
+         self.requant_weight_dtype = to_jax_dtype(envs.REQUANTIZE_WEIGHT_DTYPE)
++        # Round requantization scales up to powers of two. For checkpoints
++        # whose block scales are already powers of two (ue8m0), requantizing
++        # to the same dtype at a block size dividing the original is lossless.
++        self.requant_power_of_two_scale = False
+diff --git a/tpu_inference/layers/common/quantization/fp8.py b/tpu_inference/layers/common/quantization/fp8.py
+index 388a6a8..6fe6613 100644
+--- a/tpu_inference/layers/common/quantization/fp8.py
++++ b/tpu_inference/layers/common/quantization/fp8.py
+@@ -92,6 +92,7 @@ class Fp8LinearMethod:
+     'fuse_matmuls',
+     'n_shards',
+     'enable_kernel',
++    'power_of_two_scale',
+ ))
+ def process_blockwise_fp8_linear_weights(
+     weight: jax.Array,
+@@ -105,6 +106,7 @@ def process_blockwise_fp8_linear_weights(
+     fuse_matmuls,
+     n_shards,
+     enable_kernel: bool = False,
++    power_of_two_scale: bool = False,
+ ) -> LinearWeights:
+     if envs.DISABLE_WEIGHT_REQUANTIZATION:
+         logger.info_once(
+@@ -164,7 +166,8 @@ def process_blockwise_fp8_linear_weights(
+             requant_weight_dtype,
+             dequantized_weight,
+             axis=0,
+-            block_size=requant_block_size)
++            block_size=requant_block_size,
++            power_of_two_scale=power_of_two_scale)
+ 
+         weights.append(weight_slice)
+         weight_scales.append(weight_scale_slice)
+diff --git a/tpu_inference/layers/vllm/custom_ops/experimental/deepseek_v4/deepseek_v4_attention.py b/tpu_inference/layers/vllm/custom_ops/experimental/deepseek_v4/deepseek_v4_attention.py
+index b71437e..627bd53 100644
+--- a/tpu_inference/layers/vllm/custom_ops/experimental/deepseek_v4/deepseek_v4_attention.py
++++ b/tpu_inference/layers/vllm/custom_ops/experimental/deepseek_v4/deepseek_v4_attention.py
+@@ -249,6 +249,11 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
+         """Inverse-RoPE + wo_a (per-group bmm) + wo_b output projection.
+         """
+         mesh = get_vllm_model_wrapper_context().mesh
++        wo_a = jax_view(self.wo_a.weight)
++        wo_a_scale = jax_view(self.wo_a.weight_scale)
++        # wo_a is kept as exact bf16 (VllmDeepseekV4WoALinearMethod), as in
++        # the reference model; only an fp8 wo_a quantizes the activations.
++        quantize_activations = wo_a.dtype != jnp.bfloat16
+         # fused_reverse_rope_wo_a_projection assume data parallelism
+         # for the attention layer.
+         z = jax.shard_map(
+@@ -256,7 +261,7 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
+                 fused_reverse_rope_wo_a_projection,
+                 head_dim=self.head_dim,
+                 inverse=True,
+-                quantize_activations=True,
++                quantize_activations=quantize_activations,
+             ),
+             mesh=mesh,
+             in_specs=(
+@@ -272,8 +277,8 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
+             jax_view(o),
+             jax_view(positions),
+             jax_view(self.rotary_emb.cos_sin_cache),
+-            jax_view(self.wo_a.weight),
+-            jax_view(self.wo_a.weight_scale),
++            wo_a,
++            wo_a_scale,
+         )
+ 
+         # --- wo_b: RowParallelLinear back to hidden_size (returns (out, bias)).
+diff --git a/tpu_inference/layers/vllm/quantization/deepseek_v4_fp8.py b/tpu_inference/layers/vllm/quantization/deepseek_v4_fp8.py
+index f4b2427..15ecf9a 100644
+--- a/tpu_inference/layers/vllm/quantization/deepseek_v4_fp8.py
++++ b/tpu_inference/layers/vllm/quantization/deepseek_v4_fp8.py
+@@ -14,7 +14,11 @@
+ 
+ from typing import Optional, Union
+ 
++import jax
++import jax.numpy as jnp
+ import torch
++from torch.nn import Parameter
++from torchax.interop import jax_view, torch_view
+ from vllm.model_executor.layers import linear as vllm_linear
+ from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.quantization import \
+@@ -23,6 +27,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
+     is_layer_skipped
+ from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
+ 
++from tpu_inference import envs
+ from tpu_inference.layers.common.quant_methods import DSV4_FP8
+ from tpu_inference.layers.jax.quantization import QuantizeMethodBase
+ from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
+@@ -36,6 +41,41 @@ from tpu_inference.logger import init_logger
+ logger = init_logger(__name__)
+ 
+ 
++def _dequantize_linear_weight(w: jax.Array, s: jax.Array) -> jax.Array:
++    """Exact bf16 copy of a processed [in, out] fp8 linear weight."""
++    k, n = w.shape
++    w = w.astype(jnp.float32)
++    if s.ndim == 1:  # per output channel
++        w = w * s[None, :]
++    elif s.ndim == 2:  # [in_blocks, out_blocks] (requantization disabled)
++        kb, nb = s.shape
++        w = (w.reshape(kb, k // kb, nb, n // nb) *
++             s[:, None, :, None]).reshape(k, n)
++    else:  # [(1,) in_blocks, 1, out]: block quantized-matmul kernel layout
++        s = s.reshape(-1, n)
++        w = (w.reshape(s.shape[0], -1, n) * s[:, None, :]).reshape(k, n)
++    return w.astype(jnp.bfloat16)
++
++
++class VllmDeepseekV4WoALinearMethod(VllmFp8LinearMethod):
++    """DeepSeek-V4 attention ``wo_a``.
++
++    It is consumed by the fused inverse-RoPE + grouped-bmm kernel rather than a
++    matmul, and the reference model runs it in bf16 on the dequantized fp8
++    weight. Load it like any fp8 linear, then keep an exact bf16 copy with a
++    unit per-channel scale.
++    """
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        super().process_weights_after_loading(layer)
++        w = _dequantize_linear_weight(jax_view(layer.weight),
++                                      jax_view(layer.weight_scale))
++        layer.weight = Parameter(torch_view(w), requires_grad=False)
++        layer.weight_scale = Parameter(torch_view(
++            jnp.ones((w.shape[1], ), jnp.float32)),
++                                       requires_grad=False)
++
++
+ @register_quantization_config(DSV4_FP8)
+ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
+     """TPU quantization config for "deepseek_v4_fp8" format.
+@@ -64,6 +104,20 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
+                         fused_mapping=self.packed_modules_mapping,
+                 ):
+                     return VllmUnquantizedLinearMethod(linear_config)
++                if (self.weight_block_size is not None
++                        and envs.REQUANTIZE_BLOCK_SIZE is None
++                        and not envs.DISABLE_WEIGHT_REQUANTIZATION):
++                    # Block scales are ue8m0 (powers of two): requantizing to
++                    # 1 x block K-blocks with power-of-two scales reproduces
++                    # every weight exactly, and the block quantized-matmul
++                    # kernel keeps activations in bf16. The per-channel
++                    # default would round weights a second time.
++                    linear_config.requant_block_size = self.weight_block_size[
++                        0]
++                    linear_config.enable_quantized_matmul_kernel = True
++                    linear_config.requant_power_of_two_scale = True
++                if prefix.endswith(".wo_a"):
++                    return VllmDeepseekV4WoALinearMethod(self, linear_config)
+                 return VllmFp8LinearMethod(self, linear_config)
+             case RoutedExperts():
+                 if is_layer_skipped(
+@@ -76,7 +130,7 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
+                 if self.expert_dtype == "fp4":
+                     if self.moe_quant_algo == "NVFP4":
+                         # TODO: support NVFP4.
+-                        return NotImplementedError(
++                        raise NotImplementedError(
+                             "NVFP4 is not supported yet.")
+ 
+                     moe_config = self.get_moe_config(layer)
+diff --git a/tpu_inference/layers/vllm/quantization/fp8.py b/tpu_inference/layers/vllm/quantization/fp8.py
+index 9630445..6d031c1 100644
+--- a/tpu_inference/layers/vllm/quantization/fp8.py
++++ b/tpu_inference/layers/vllm/quantization/fp8.py
+@@ -276,7 +276,9 @@ class VllmFp8LinearMethod(
+                 requant_weight_dtype=self.linear_config.requant_weight_dtype,
+                 fuse_matmuls=self.linear_config.fuse_matmuls,
+                 n_shards=self.linear_config.n_shards,
+-                enable_kernel=self.linear_config.enable_quantized_matmul_kernel
++                enable_kernel=self.linear_config.enable_quantized_matmul_kernel,
++                power_of_two_scale=self.linear_config.
++                requant_power_of_two_scale,
+             )
+         else:
+             if self.linear_config.fuse_matmuls and weight_scale.ndim == 1:
+diff --git a/tpu_inference/layers/vllm/quantization/mxfp4.py b/tpu_inference/layers/vllm/quantization/mxfp4.py
+index 1f48332..a681df9 100644
+--- a/tpu_inference/layers/vllm/quantization/mxfp4.py
++++ b/tpu_inference/layers/vllm/quantization/mxfp4.py
+@@ -46,7 +46,8 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
+     shard_moe_weights)
+ from tpu_inference.layers.common.quant_methods import MXFP4
+ from tpu_inference.layers.common.quantization import (
+-    MXFP4_REQUANTIZED_BLOCK_SIZE, dequantize_tensor_from_mxfp4_packed)
++    MXFP4_BLOCK_SIZE, MXFP4_REQUANTIZED_BLOCK_SIZE,
++    dequantize_tensor_from_mxfp4_packed)
+ from tpu_inference.layers.common.sharding import ShardingAxisName
+ from tpu_inference.layers.vllm.interface.moe import (
+     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
+@@ -184,6 +185,11 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
+                 desired_quant_dtype,
+                 requant_block_size,
+                 w13_interleave=w13_interleave,
++                # Same dtype and block size as the checkpoint: power-of-two
++                # scales make the round trip exact (bit-identical codes).
++                power_of_two_scale=(
++                    desired_quant_dtype == jnp.float4_e2m1fn
++                    and requant_block_size == MXFP4_BLOCK_SIZE),
+             )
+             return process_moe_weights(
+                 weights,

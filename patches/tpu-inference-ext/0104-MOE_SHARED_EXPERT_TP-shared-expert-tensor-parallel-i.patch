@@ -1,0 +1,500 @@
+From 051a8a2b9d65cced1d7e1344d228239cd261187b Mon Sep 17 00:00:00 2001
+From: dsv4-moe-overlap <w@x>
+Date: Tue, 20 Oct 2026 17:43:26 +0100
+Subject: [PATCH 104/108] MOE_SHARED_EXPERT_TP: shared expert tensor-parallel
+ inside the routed MoE reduce-scatter
+
+---
+ tpu_inference/envs.py                         |   8 ++
+ tpu_inference/layers/common/fused_moe_gmm.py  |  47 +++++++-
+ tpu_inference/layers/common/moe.py            |   7 ++
+ .../layers/common/shared_expert_tp.py         | 104 +++++++++++++++++
+ .../layers/vllm/custom_ops/fused_moe.py       |  32 ++++++
+ tpu_inference/layers/vllm/interface/moe.py    |   7 ++
+ .../vllm/process_weights/shared_expert_tp.py  | 108 ++++++++++++++++++
+ .../models/vllm/vllm_model_wrapper.py         |   6 +
+ 8 files changed, 317 insertions(+), 2 deletions(-)
+ create mode 100644 tpu_inference/layers/common/shared_expert_tp.py
+ create mode 100644 tpu_inference/layers/vllm/process_weights/shared_expert_tp.py
+
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index ffd39ec88..c1ca6a46b 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -92,6 +92,7 @@ if TYPE_CHECKING:
+     MOE_ONESHOT_SCATTER: bool = False
+     MOE_ONESHOT_MAX_TOKENS: int = 512
+     MOE_TP_EXPERT_SPLIT: int = 1
++    MOE_SHARED_EXPERT_TP: bool = False
+     MOE_HIERARCHICAL_COLLECT: bool = False
+     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
+     RAGGED_GATHER_TRIM_ROWS: bool = True
+@@ -583,6 +584,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # load time and the partial-sum grouping (reduction order). 1 = off.
+     "MOE_TP_EXPERT_SPLIT":
+     lambda: int(os.getenv("MOE_TP_EXPERT_SPLIT") or "1"),
++    # With attention DP + GMM_TP: compute the shared expert tensor-parallel
++    # (1/tp of its intermediate dim per shard, bf16, exact dequant) inside the
++    # routed MoE and sum it in the routed reduce-scatter, instead of every
++    # chip streaming the whole replicated FP8 shared expert for its own rows.
++    # Reduction-order change. See layers/common/shared_expert_tp.py.
++    "MOE_SHARED_EXPERT_TP":
++    env_bool("MOE_SHARED_EXPERT_TP", default=False),
+     # The reverse for the EP collect: each chip's two cores add column halves
+     # on-chip, then reduce-scatter half the columns over the attention-data
+     # axes. Same mesh and hidden-size conditions as MOE_HIERARCHICAL_DISPATCH.
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index 820b0ddbd..c223d424d 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -33,6 +33,8 @@ from tpu_inference.kernels.sparse_core.ragged_gather_v2 import \
+     ragged_gather_v2 as ragged_gather
+ from tpu_inference.layers.common.linear import _safe_calculate_tiling
+ from tpu_inference.layers.common.quantization import quantize_tensor
++from tpu_inference.layers.common.shared_expert_tp import \
++    tp_shared_expert_partial_local
+ from tpu_inference.layers.common.sharding import ShardingAxisName
+ from tpu_inference.logger import init_logger
+ from tpu_inference.utils import get_mesh_shape_product
+@@ -321,6 +323,7 @@ def moe_gmm_local(x: jax.Array,
+                   group_offset: jax.Array,
+                   topk_argsort_revert_indices: jax.Array,
+                   topk_weights: jax.Array,
++                  shared_partial: jax.Array | None = None,
+                   *,
+                   activation: str,
+                   topk: int,
+@@ -331,7 +334,8 @@ def moe_gmm_local(x: jax.Array,
+                   moe_chunk_size: int = 0,
+                   defer_all_reduce: bool = False,
+                   hierarchical_collect: tuple | None = None,
+-                  oneshot_mesh_axes: tuple | None = None) -> jax.Array:
++                  oneshot_mesh_axes: tuple | None = None,
++                  routed_scale: float = 1.0) -> jax.Array:
+     """Main MoE logic on a local shard can run in TP or EP mode.
+ 
+     Set parallelism for "tp" or "ep"
+@@ -471,6 +475,13 @@ def moe_gmm_local(x: jax.Array,
+                 topk_weights,
+                 topk,
+             )
++        if shared_partial is not None:
++            # MOE_SHARED_EXPERT_TP: this shard's shared-expert partial joins the
++            # routed partial before the reduce-scatter. The routed scaling
++            # factor applies to the routed part only (the runner skips it).
++            assert not is_pipelined
++            chunk_hidden = (chunk_hidden.astype(jnp.float32) * routed_scale +
++                            shared_partial).astype(chunk_hidden.dtype)
+         if enable_rs_kernel:
+             rs_out = hier_rs_sc.hierarchical_reduce_scatter_local(
+                 chunk_hidden,
+@@ -531,6 +542,8 @@ def tensor_parallel_gmm(
+     moe_chunk_size: int = 0,
+     defer_all_reduce: bool = False,
+     oneshot_scatter: bool = False,
++    shared_partial: jax.Array | None = None,
++    routed_scale: float = 1.0,
+ ) -> jax.Array:
+     data_p_spec = P(ShardingAxisName.MLP_DATA)
+     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
+@@ -566,6 +579,7 @@ def tensor_parallel_gmm(
+             moe_chunk_size=moe_chunk_size,
+             defer_all_reduce=defer_all_reduce,
+             oneshot_mesh_axes=(mesh.axis_names if oneshot_scatter else None),
++            routed_scale=routed_scale,
+         ),
+         mesh=mesh,
+         in_specs=(
+@@ -580,7 +594,8 @@ def tensor_parallel_gmm(
+             P(),
+             data_p_spec,
+             data_p_spec,
+-        ),
++        ) + ((P(ShardingAxisName.MLP_TENSOR, None), )
++             if shared_partial is not None else ()),
+         out_specs=(final_out_specs),
+         check_vma=False,
+     )(
+@@ -595,6 +610,7 @@ def tensor_parallel_gmm(
+         group_offset,
+         topk_argsort_revert_indices,
+         topk_weights,
++        *(() if shared_partial is None else (shared_partial, )),
+     )
+ 
+ 
+@@ -901,6 +917,8 @@ def _apply_hierarchical_dispatch_gather(hidden_states: jax.Array,
+     "scatter_results",
+     "moe_chunk_size",
+     "defer_all_reduce",
++    "shared_act_limit",
++    "routed_scale",
+ ))
+ def fused_moe_func(
+     hidden_states: jax.Array,
+@@ -927,6 +945,10 @@ def fused_moe_func(
+     expert_score_correction_bias: jax.Array | None = None,
+     moe_chunk_size: int = 0,
+     num_valid_tokens: jax.Array | None = None,
++    shared_w_gu: jax.Array | None = None,
++    shared_w_down: jax.Array | None = None,
++    shared_act_limit: float | None = None,
++    routed_scale: float = 1.0,
+ ) -> jax.Array:
+     """Route tokens in hidden_states into each experts based on routing.
+ 
+@@ -1161,6 +1183,25 @@ def fused_moe_func(
+             defer_all_reduce=defer_all_reduce,
+         )
+     else:
++        shared_partial = None
++        if shared_w_gu is not None:
++            # MOE_SHARED_EXPERT_TP: each MLP_TENSOR shard's partial shared
++            # expert output for all rows, stacked on MLP_TENSOR so that
++            # tensor_parallel_gmm hands every shard its own partial.
++            assert scatter_results and not actual_enable_rs_kernel
++            assert moe_chunk_size == 0 or num_tokens <= moe_chunk_size
++            logger.info_once("[MoE]: shared expert tensor-parallel in the "
++                             "routed reduce-scatter (MOE_SHARED_EXPERT_TP)")
++            shared_partial = jax.shard_map(
++                functools.partial(tp_shared_expert_partial_local,
++                                  limit=shared_act_limit),
++                mesh=mesh,
++                in_specs=(P(ShardingAxisName.MLP_DATA, None),
++                          P(None, ShardingAxisName.MLP_TENSOR),
++                          P(ShardingAxisName.MLP_TENSOR, None)),
++                out_specs=P(ShardingAxisName.MLP_TENSOR, None),
++                check_vma=False,
++            )(hidden_states, shared_w_gu, shared_w_down)
+         oneshot_scatter = (envs.MOE_ONESHOT_SCATTER and scatter_results
+                            and not actual_enable_rs_kernel
+                            and num_tokens <= envs.MOE_ONESHOT_MAX_TOKENS)
+@@ -1186,6 +1227,8 @@ def fused_moe_func(
+             moe_chunk_size=moe_chunk_size,
+             defer_all_reduce=defer_all_reduce,
+             oneshot_scatter=oneshot_scatter,
++            shared_partial=shared_partial,
++            routed_scale=routed_scale if shared_partial is not None else 1.0,
+         )
+ 
+     return x[:num_tokens, :hidden_size]
+diff --git a/tpu_inference/layers/common/moe.py b/tpu_inference/layers/common/moe.py
+index 68613f883..5637c2b75 100644
+--- a/tpu_inference/layers/common/moe.py
++++ b/tpu_inference/layers/common/moe.py
+@@ -178,6 +178,13 @@ def moe_apply(
+                     moe_chunk_size=moe_chunk_size,
+                     num_valid_tokens=extra_backend_kwargs.get(
+                         "num_valid_tokens", None),
++                    shared_w_gu=extra_backend_kwargs.get("shared_w_gu", None),
++                    shared_w_down=extra_backend_kwargs.get(
++                        "shared_w_down", None),
++                    shared_act_limit=extra_backend_kwargs.get(
++                        "shared_act_limit", None),
++                    routed_scale=extra_backend_kwargs.get(
++                        "routed_scale", 1.0),
+                 )
+             case MoEBackend.DENSE_MAT:
+                 # NOTE: circular import avoidance
+diff --git a/tpu_inference/layers/common/shared_expert_tp.py b/tpu_inference/layers/common/shared_expert_tp.py
+new file mode 100644
+index 000000000..afd9aa716
+--- /dev/null
++++ b/tpu_inference/layers/common/shared_expert_tp.py
+@@ -0,0 +1,104 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Shared expert computed tensor-parallel inside the routed MoE (MOE_SHARED_EXPERT_TP).
++
++With attention data parallelism every chip holds the whole shared expert and
++runs it on its own few rows: at decode each chip streams ~25 MB of FP8 weights
++per DeepSeek V4 layer to multiply 1-4 rows. The routed experts already
++all-gather every row to every chip and reduce-scatter per-chip partial sums.
++Here the shared expert is sliced like a routed expert instead: chip c holds
++columns [c*I/tp, (c+1)*I/tp) of gate and up and the matching rows of down
++(bf16, dequantized exactly: the FP8 block scales are powers of two), computes
++its partial output for all gathered rows, and the routed reduce-scatter sums
++it with the routed partials. No extra collective; ~1.5 MB of weights per chip.
++Only the summation order of the shared expert's down projection changes.
++"""
++
++import jax
++import jax.numpy as jnp
++from jax.sharding import Mesh, NamedSharding
++from jax.sharding import PartitionSpec as P
++
++from tpu_inference.layers.common.sharding import ShardingAxisName
++
++
++def dequantize_block_fp8(w: jax.Array, s: jax.Array | None,
++                         dtype=jnp.bfloat16) -> jax.Array:
++    """[K, N] fp8 weight with per-(K block, column) scales -> [K, N] dtype.
++
++    ``s`` is any of [nb, N], [nb, 1, N], [1, nb, 1, N] (gmm layouts). With
++    power-of-two scales the result is exact in bf16.
++    """
++    k, n = w.shape
++    if s is None:
++        return w.astype(dtype)
++    s = jnp.asarray(s, jnp.float32)
++    assert s.size % n == 0, (s.shape, w.shape)
++    nb = s.size // n
++    s = s.reshape(nb, n)
++    assert k % nb == 0, (k, nb)
++    wf = w.astype(jnp.float32).reshape(nb, k // nb, n) * s[:, None, :]
++    return wf.reshape(k, n).astype(dtype)
++
++
++def build_tp_shared_expert(w_gate: jax.Array, w_up: jax.Array,
++                           w_down: jax.Array, *, mesh: Mesh,
++                           dtype=jnp.bfloat16):
++    """Dense [H, I] gate/up and [I, H] down -> TP-sliced arrays.
++
++    Returns (w_gu [H, tp * 2 * I/tp], w_down [I, H]) sharded on MLP_TENSOR so
++    shard c holds [gate cols | up cols] of slice c and down rows of slice c.
++    """
++    tp = 1
++    axes = ShardingAxisName.MLP_TENSOR
++    for a in ((axes, ) if isinstance(axes, str) else axes):
++        tp *= mesh.shape.get(a, 1)
++    h, i = w_gate.shape
++    assert w_up.shape == (h, i) and w_down.shape == (i, h), (w_gate.shape,
++                                                            w_up.shape,
++                                                            w_down.shape)
++    assert i % tp == 0, (i, tp)
++    loc = i // tp
++    gu = jnp.stack([w_gate.reshape(h, tp, loc),
++                    w_up.reshape(h, tp, loc)], axis=2)  # [H, tp, 2, loc]
++    gu = gu.reshape(h, tp * 2 * loc).astype(dtype)
++    gu = jax.device_put(gu, NamedSharding(mesh, P(None, axes)))
++    down = jax.device_put(w_down.astype(dtype),
++                          NamedSharding(mesh, P(axes, None)))
++    return gu, down
++
++
++def silu_and_mul_clamp(gate_up: jax.Array, limit: float | None) -> jax.Array:
++    """Same op sequence as vLLM SiluAndMulWithClamp.forward_native (alpha=1,
++    beta=0) / SiluAndMul, in the input dtype."""
++    d = gate_up.shape[-1] // 2
++    gate, up = gate_up[..., :d], gate_up[..., d:]
++    if limit is None:
++        return gate * jax.nn.sigmoid(gate) * up
++    gate = jnp.minimum(gate, jnp.asarray(limit, gate.dtype))
++    up = jnp.clip(up, -limit, limit).astype(up.dtype)
++    return gate * jax.nn.sigmoid(gate) * (up + jnp.asarray(0.0, up.dtype))
++
++
++def tp_shared_expert_partial_local(x: jax.Array, w_gu: jax.Array,
++                                   w_down: jax.Array,
++                                   limit: float | None) -> jax.Array:
++    """This shard's partial shared-expert output for all rows of x (f32).
++
++    Mirrors the replicated path's rounding points: gate_up in x.dtype, the
++    activation in x.dtype, the down projection accumulated in f32.
++    """
++    gu = jnp.dot(x, w_gu, preferred_element_type=jnp.float32).astype(x.dtype)
++    h = silu_and_mul_clamp(gu, limit)
++    return jnp.dot(h, w_down, preferred_element_type=jnp.float32)
+diff --git a/tpu_inference/layers/vllm/custom_ops/fused_moe.py b/tpu_inference/layers/vllm/custom_ops/fused_moe.py
+index de897dec5..31f55e0c1 100644
+--- a/tpu_inference/layers/vllm/custom_ops/fused_moe.py
++++ b/tpu_inference/layers/vllm/custom_ops/fused_moe.py
+@@ -75,6 +75,38 @@ def _gmm_and_shared_reduce_over_same_axes(mesh: Mesh,
+ @MoERunner.register_oot
+ class VllmMoERunner(MoERunner):
+ 
++    @property
++    def _shared_expert_tp(self) -> bool:
++        """MOE_SHARED_EXPERT_TP: the shared expert runs tensor-parallel inside
++        the routed MoE (see attach_tp_shared_experts); its replicated path
++        and the post-MoE routed scaling are skipped."""
++        return getattr(self.routed_experts, "shared_tp_w_gu", None) is not None
++
++    def _apply_quant_method(
++        self,
++        hidden_states: torch.Tensor,
++        router_logits: torch.Tensor,
++        shared_experts_input: torch.Tensor | None,
++        input_ids: torch.Tensor | None = None,
++        shared_experts_overlapping: bool = False,
++    ):
++        if not self._shared_expert_tp:
++            return super()._apply_quant_method(hidden_states, router_logits,
++                                               shared_experts_input,
++                                               input_ids,
++                                               shared_experts_overlapping)
++        assert self.routed_experts.quant_method.is_monolithic
++        fused_out = self.routed_experts.forward_monolithic(
++            x=hidden_states, router_logits=router_logits, input_ids=input_ids)
++        return None, fused_out
++
++    def _maybe_apply_routed_scale_to_output(self, shared_output, fused_output):
++        if self._shared_expert_tp:
++            # Applied to the routed partial sums inside fused_moe_func.
++            return shared_output, fused_output
++        return super()._maybe_apply_routed_scale_to_output(
++            shared_output, fused_output)
++
+     @property
+     def _fused_output_is_reduced(self) -> bool:
+         # Returns False -- i.e. the GMM kernel skips its own all-reduce and the
+diff --git a/tpu_inference/layers/vllm/interface/moe.py b/tpu_inference/layers/vllm/interface/moe.py
+index 454193e37..94a7c3b3f 100644
+--- a/tpu_inference/layers/vllm/interface/moe.py
++++ b/tpu_inference/layers/vllm/interface/moe.py
+@@ -128,6 +128,13 @@ def vllm_moe_apply(layer: RoutedExperts,
+         runner = get_layer_from_name(layer.layer_name)
+         extra_kwargs["defer_all_reduce"] = not runner._fused_output_is_reduced
+ 
++    # MOE_SHARED_EXPERT_TP: weights attached by attach_tp_shared_experts.
++    if getattr(layer, "shared_tp_w_gu", None) is not None:
++        extra_kwargs["shared_w_gu"] = jax_view(layer.shared_tp_w_gu)
++        extra_kwargs["shared_w_down"] = jax_view(layer.shared_tp_w_down)
++        extra_kwargs["shared_act_limit"] = layer.shared_tp_act_limit
++        extra_kwargs["routed_scale"] = layer.shared_tp_routed_scale
++
+     if getattr(layer, "hash_indices_table", None) is not None:
+         assert input_ids is not None, "input_ids must be provided when hash_indices_table is present in the layer"
+         hash_table = layer.hash_indices_table
+diff --git a/tpu_inference/layers/vllm/process_weights/shared_expert_tp.py b/tpu_inference/layers/vllm/process_weights/shared_expert_tp.py
+new file mode 100644
+index 000000000..f620da7fb
+--- /dev/null
++++ b/tpu_inference/layers/vllm/process_weights/shared_expert_tp.py
+@@ -0,0 +1,108 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Load-time setup for MOE_SHARED_EXPERT_TP (see layers/common/shared_expert_tp.py)."""
++
++import jax
++import jax.numpy as jnp
++import torch
++from jax.sharding import Mesh
++from torch.nn.parameter import Parameter
++from torchax.interop import jax_view, torch_view
++
++from tpu_inference import envs
++from tpu_inference.layers.common.moe import MoEBackend
++from tpu_inference.layers.common.shared_expert_tp import (
++    build_tp_shared_expert, dequantize_block_fp8)
++from tpu_inference.layers.common.sharding import is_attn_dp
++from tpu_inference.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++def _dense_weights(linear: torch.nn.Module) -> list[jax.Array]:
++    """Processed (FP8 block-quant or bf16) linear weight(s) as [K, N] arrays."""
++    ws, ss = linear.weight, getattr(linear, "weight_scale", None)
++    if isinstance(ws, torch.nn.ParameterList):
++        ss = list(ss) if ss is not None else [None] * len(ws)
++        return [
++            dequantize_block_fp8(jax_view(w),
++                                 None if s is None else jax_view(s))
++            for w, s in zip(ws, ss)
++        ]
++    return [
++        dequantize_block_fp8(jax_view(ws), None if ss is None else jax_view(ss))
++    ]
++
++
++def _act_limit(act_fn) -> tuple[bool, float | None]:
++    name = type(act_fn).__name__
++    if name == "SiluAndMul":
++        return True, None
++    if name == "SiluAndMulWithClamp" and getattr(act_fn, "alpha", 1.0) == 1.0 \
++            and getattr(act_fn, "beta", 0.0) == 0.0:
++        return True, float(act_fn.swiglu_limit)
++    return False, None
++
++
++def attach_tp_shared_experts(model: torch.nn.Module, mesh: Mesh) -> int:
++    """Give every eligible MoE runner a tensor-parallel copy of its shared
++    expert (on its RoutedExperts layer). Returns the number of layers."""
++    if not envs.MOE_SHARED_EXPERT_TP:
++        return 0
++    if not is_attn_dp(mesh):
++        logger.warning("MOE_SHARED_EXPERT_TP needs attention data "
++                       "parallelism; ignored.")
++        return 0
++    from tpu_inference.layers.vllm.custom_ops.fused_moe import VllmMoERunner
++    n = 0
++    for name, runner in model.named_modules():
++        if not isinstance(runner, VllmMoERunner):
++            continue
++        shared = runner._shared_experts
++        routed = runner.routed_experts
++        qm = getattr(routed, "quant_method", None)
++        mlp = getattr(shared, "_layer", None)
++        ok_act, limit = _act_limit(getattr(mlp, "act_fn", None))
++        if (shared is None or mlp is None or not ok_act
++                or getattr(qm, "moe_backend", None) != MoEBackend.GMM_TP
++                or not getattr(qm, "is_monolithic", False)
++                or getattr(runner, "routed_input_transform", None) is not None
++                or getattr(runner, "routed_output_transform", None) is not None
++                or getattr(runner, "shared_expert_gate", None) is not None
++                or not hasattr(mlp, "gate_up_proj")
++                or not hasattr(mlp, "down_proj")):
++            logger.warning_once(
++                "MOE_SHARED_EXPERT_TP: %s not eligible; keeping the "
++                "replicated shared expert there.", name)
++            continue
++        gu = _dense_weights(mlp.gate_up_proj)
++        if len(gu) == 1:
++            w_gate, w_up = jnp.split(gu[0], 2, axis=1)
++        else:
++            w_gate, w_up = gu
++        (w_down, ) = _dense_weights(mlp.down_proj)
++        w_gu_tp, w_down_tp = build_tp_shared_expert(w_gate,
++                                                    w_up,
++                                                    w_down,
++                                                    mesh=mesh)
++        routed.shared_tp_w_gu = Parameter(torch_view(w_gu_tp),
++                                          requires_grad=False)
++        routed.shared_tp_w_down = Parameter(torch_view(w_down_tp),
++                                            requires_grad=False)
++        routed.shared_tp_act_limit = limit
++        routed.shared_tp_routed_scale = float(runner.routed_scaling_factor)
++        n += 1
++    logger.info("MOE_SHARED_EXPERT_TP: shared expert tensor-parallel in %d "
++                "MoE layers.", n)
++    return n
+diff --git a/tpu_inference/models/vllm/vllm_model_wrapper.py b/tpu_inference/models/vllm/vllm_model_wrapper.py
+index 2bd9463a8..0722d3912 100644
+--- a/tpu_inference/models/vllm/vllm_model_wrapper.py
++++ b/tpu_inference/models/vllm/vllm_model_wrapper.py
+@@ -280,6 +280,12 @@ class VllmModelWrapper:
+             set_eagle3_aux_hidden_state_layers(
+                 vllm_model, self.vllm_config.speculative_config)
+ 
++        # MOE_SHARED_EXPERT_TP (no-op unless set): add the tensor-parallel
++        # shared expert weights before the parameters are collected.
++        from tpu_inference.layers.vllm.process_weights.shared_expert_tp import \
++            attach_tp_shared_experts
++        attach_tp_shared_experts(vllm_model, self.mesh)
++
+         self.model = _VllmRunner(vllm_model)
+         params_and_buffers = shard_model_to_tpu(self.model, self.mesh)
+ 

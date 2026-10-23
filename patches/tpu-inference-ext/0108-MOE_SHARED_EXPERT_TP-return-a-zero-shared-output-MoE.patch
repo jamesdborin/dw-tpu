@@ -1,0 +1,28 @@
+From f9d34b9d7c8f1452d64942de88b63fb03f4ee51e Mon Sep 17 00:00:00 2001
+From: dsv4-moe-overlap <w@x>
+Date: Wed, 21 Oct 2026 17:23:00 +0100
+Subject: [PATCH 108/108] MOE_SHARED_EXPERT_TP: return a zero shared output
+ (MoERunner._maybe_combine requires one)
+
+---
+ tpu_inference/layers/vllm/custom_ops/fused_moe.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/tpu_inference/layers/vllm/custom_ops/fused_moe.py b/tpu_inference/layers/vllm/custom_ops/fused_moe.py
+index 31f55e0c1..89d1034a1 100644
+--- a/tpu_inference/layers/vllm/custom_ops/fused_moe.py
++++ b/tpu_inference/layers/vllm/custom_ops/fused_moe.py
+@@ -98,7 +98,12 @@ class VllmMoERunner(MoERunner):
+         assert self.routed_experts.quant_method.is_monolithic
+         fused_out = self.routed_experts.forward_monolithic(
+             x=hidden_states, router_logits=router_logits, input_ids=input_ids)
+-        return None, fused_out
++        # The runner requires a shared output whenever it has shared experts
++        # (_maybe_combine asserts it): the shared expert's contribution is
++        # already in fused_out, so hand back zeros.
++        shared_like = (shared_experts_input
++                       if shared_experts_input is not None else hidden_states)
++        return torch.zeros_like(shared_like), fused_out
+ 
+     def _maybe_apply_routed_scale_to_output(self, shared_output, fused_output):
+         if self._shared_expert_tp:

@@ -1,0 +1,14 @@
+diff --git a/tpu_inference/worker/tpu_worker.py b/tpu_inference/worker/tpu_worker.py
+--- a/tpu_inference/worker/tpu_worker.py
++++ b/tpu_inference/worker/tpu_worker.py
+@@ -629,6 +629,10 @@
+     def profile(self,
+                 is_start: bool = True,
+                 profile_prefix: str | None = None):
++        # The executor broadcasts this RPC, but only configured ranks capture.
++        # Exporting an unconfigured rank's trace would write to str(None).
++        if self.profile_dir is None:
++            return
+         if is_start:
+             standard_opts, advanced_opts = _parse_profile_options(
+                 profile_prefix)

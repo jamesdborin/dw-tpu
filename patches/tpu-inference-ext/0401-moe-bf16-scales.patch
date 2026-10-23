@@ -1,0 +1,141 @@
+From fd23d3db5bba9344938ae9a9013dcd909f44b4e8 Mon Sep 17 00:00:00 2001
+From: James Dborin <james.dborin@doubleword.ai>
+Date: Thu, 22 Oct 2026 12:34:44 +0100
+Subject: [PATCH] MoE: MOE_SCALE_BF16 stores GMM expert block scales as bf16
+ (exact)
+
+Requantized FP4 routed-expert block-32 scales are stored f32 (~4 GiB/chip
+for DeepSeek V4 Flash at TP8). They are powers of two, so bf16 holds them
+exactly. With MOE_SCALE_BF16=1 (default off) they are stored as bf16 when
+the per-layer round trip is lossless, kept in XLA's default layout (the
+forced (0,1,2,3) layout tiles the unit dim to 2 rows and would save
+nothing), and gmm_wrapper widens them back to f32 before gmm_v2, so the
+kernel sees the same f32 values: bit-identical outputs, no kernel change.
+Saves ~2.0 GiB/chip at TP8 for one layer's f32 scale copy per gmm call
+(deviceless v6e AOT: args -50% of scale bytes, temp +1 layer, not hoisted).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MQhK9cavqLsEnxm6YHREB3
+---
+ tpu_inference/envs.py                         |  8 +++++
+ tpu_inference/layers/common/fused_moe_gmm.py  |  3 ++
+ .../common/process_weights/moe_weights.py     | 32 +++++++++++++++++++
+ .../layers/vllm/quantization/mxfp4.py         |  5 +--
+ 4 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index 719d43467..5829db227 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -93,6 +93,7 @@ if TYPE_CHECKING:
+     MOE_ONESHOT_MAX_TOKENS: int = 512
+     MOE_TP_EXPERT_SPLIT: int = 1
+     MOE_SHARED_EXPERT_TP: bool = False
++    MOE_SCALE_BF16: bool = False
+     MOE_F32_REDUCE: bool = False
+     MOE_HIERARCHICAL_COLLECT: bool = False
+     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
+@@ -592,6 +593,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Reduction-order change. See layers/common/shared_expert_tp.py.
+     "MOE_SHARED_EXPERT_TP":
+     env_bool("MOE_SHARED_EXPERT_TP", default=False),
++    # Store requantized FP4 routed-expert block scales as bf16 instead of f32
++    # (GMM_TP / GMM_EP), widened back to f32 at each gmm call. Exact: the
++    # block-32 fp4 requant scales are powers of two (lossless round trip is
++    # checked at load). Halves persistent scale HBM (~2 GiB per chip for
++    # DeepSeek V4 Flash at TP8) for one layer's f32 scale copy per call.
++    "MOE_SCALE_BF16":
++    env_bool("MOE_SCALE_BF16", default=False),
+     # GMM_TP + attention DP: combine each shard's routed partial in f32 and
+     # reduce-scatter f32 partials (one bf16 rounding of the MoE output instead
+     # of one per shard plus the collective's own). More accurate than the
+diff --git a/tpu_inference/layers/common/fused_moe_gmm.py b/tpu_inference/layers/common/fused_moe_gmm.py
+index e7a70e4cf..ff7bd2f5c 100644
+--- a/tpu_inference/layers/common/fused_moe_gmm.py
++++ b/tpu_inference/layers/common/fused_moe_gmm.py
+@@ -186,6 +186,9 @@ def gmm_wrapper(lhs,
+                 preferred_element_type=None):
+     # uint4 expert weights are fp4 (e2m1) codes, see fp4_weight_to_codes.
+     extra = {"rhs_fp4_codes": True} if rhs.dtype == jnp.uint4 else {}
++    if rhs_scale is not None and rhs_scale.dtype == jnp.bfloat16:
++        # MOE_SCALE_BF16 storage: widen exactly; the kernel sees f32 as before.
++        rhs_scale = rhs_scale.astype(jnp.float32)
+     gmm_res = gmm_v2(
+         lhs=lhs,
+         rhs=rhs,
+diff --git a/tpu_inference/layers/common/process_weights/moe_weights.py b/tpu_inference/layers/common/process_weights/moe_weights.py
+index 421370f91..0dd733dcd 100644
+--- a/tpu_inference/layers/common/process_weights/moe_weights.py
++++ b/tpu_inference/layers/common/process_weights/moe_weights.py
+@@ -637,6 +637,36 @@ def fp4_weight_to_codes(weight: jax.Array) -> jax.Array:
+     return jax.jit(e2m1_to_codes, donate_argnums=0)(weight)
+ 
+ 
++def maybe_bf16_moe_scales(weights: FusedMoEWeights,
++                          moe_backend: MoEBackend) -> FusedMoEWeights:
++    """MOE_SCALE_BF16: store GMM expert block scales as bf16 when lossless.
++
++    The scales are only stored as bf16: gmm_wrapper widens them back to f32
++    right before gmm_v2, so the kernel sees exactly the f32 values it sees
++    today and results are bit-identical. Only scales that round-trip through
++    bf16 unchanged are converted (checked per layer; fp4 block-32 requant
++    scales are powers of two, so all of them do). shard_moe_weights keeps
++    bf16 scales in XLA's default layout, which moves the unit dim major and
++    stores them unpadded (a forced (0,1,2,3) layout tiles the unit dim to 2
++    rows and saves nothing). Cost: one layer's f32 scale copy per gmm call.
++    """
++    if (not envs.MOE_SCALE_BF16
++            or moe_backend not in (MoEBackend.GMM_TP, MoEBackend.GMM_EP)):
++        return weights
++    for key in ("w13_weight_scale", "w2_weight_scale"):
++        scale = getattr(weights, key)
++        if scale is None or scale.dtype != jnp.float32:
++            continue
++        scale_bf16 = scale.astype(jnp.bfloat16)
++        if not bool(jnp.all(scale_bf16.astype(jnp.float32) == scale)):
++            logger.warning_once(
++                "MOE_SCALE_BF16: %s is not exactly representable in bf16; "
++                "keeping f32 scales.", key)
++            continue
++        setattr(weights, key, scale_bf16)
++    return weights
++
++
+ def shard_moe_weights(
+     weights: FusedMoEWeights,
+     moe_backend: MoEBackend,
+@@ -669,6 +699,8 @@ def shard_moe_weights(
+         key = field.name
+         if (weight := getattr(weights, key, None)) is not None:
+             layout = getattr(weight_layouts, key)
++            if key.endswith("_scale") and weight.dtype == jnp.bfloat16:
++                layout = None  # MOE_SCALE_BF16: default (unpadded) layout
+             sharding = getattr(weight_shardings, key)
+             weight = general_device_put(weight, sharding, layout=layout)
+             if (key in ("w13_weight", "w2_weight") and moe_backend
+diff --git a/tpu_inference/layers/vllm/quantization/mxfp4.py b/tpu_inference/layers/vllm/quantization/mxfp4.py
+index e356ed078..46f58be48 100644
+--- a/tpu_inference/layers/vllm/quantization/mxfp4.py
++++ b/tpu_inference/layers/vllm/quantization/mxfp4.py
+@@ -43,8 +43,8 @@ from tpu_inference.layers.common.moe import \
+     FusedMoEMethodBase as TpuFusedMoEMethodBase
+ from tpu_inference.layers.common.moe import MoEBackend
+ from tpu_inference.layers.common.process_weights.moe_weights import (
+-    FusedMoEWeights, process_moe_weights, quantize_moe_weights,
+-    shard_moe_weights)
++    FusedMoEWeights, maybe_bf16_moe_scales, process_moe_weights,
++    quantize_moe_weights, shard_moe_weights)
+ from tpu_inference.layers.common.process_weights.moe_expert_split import (
+     split_gmm_tp_weights_jit, split_supported)
+ from tpu_inference.layers.common.quant_methods import MXFP4
+@@ -242,6 +242,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
+                      weights.w2_weight_scale,
+                      tp=tp,
+                      split=expert_split)
++        weights = maybe_bf16_moe_scales(weights, self.moe_backend)
+         weights = torch_view(
+             shard_moe_weights(weights, self.moe_backend, self.mesh))
+ 
+-- 
+2.34.1
+

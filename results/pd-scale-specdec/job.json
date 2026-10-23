@@ -1,0 +1,80 @@
+{
+  "id": "pd-scale-specdec",
+  "owner": "dsv4-specdec",
+  "kind": "e2e",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [
+    "dsv4-moe-overlap-e2e-base-0"
+  ],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "0",
+    "RAY_DEDUP_LOGS": "0",
+    "DRAFT_MODEL_IMPL_TYPE": "vllm",
+    "GPU_MEM": "0.68",
+    "TPU_TOKEN_PADDINGS_PER_DP": "4,8,16,32,64,512",
+    "MNBT": "512",
+    "VLLM_XLA_CHECK_RECOMPILATION": "0",
+    "MAX_SEQS": "32",
+    "MAX_LEN": "6144"
+  },
+  "serve_args_extra": [
+    "--speculative-config",
+    "{\"method\": \"mtp\", \"num_speculative_tokens\": 3, \"disable_eagle_block_drop\": true}",
+    "--enable-prompt-tokens-details"
+  ],
+  "acceptance": "sampling-equivalent",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": false,
+  "est_minutes": 100,
+  "abort_if": [
+    "post-ready RESOURCE_EXHAUSTED",
+    "launch-id mismatch",
+    "startup > 60 min",
+    "acceptance gate failure"
+  ],
+  "success": "Decode-only scaling with MTP spec (k=3): find N where per-user decode tok/s falls to ~20 on agent-replay contexts (realistic acceptance, ~2.0 tok/step) and report aggregate decode tok/s; random 2.5k/3.5k rows compare 1:1 with pd-scale-base0.",
+  "fallback": null,
+  "bench_mode": "pd",
+  "pd": {
+    "prefill": {
+      "cases": [
+        {
+          "name": "cold3k",
+          "prompt_tokens": 3000,
+          "concurrency": [
+            32
+          ]
+        }
+      ],
+      "max_tokens": 1
+    },
+    "decode": {
+      "concurrency": [
+        128,
+        192,
+        256,
+        320,
+        384,
+        448,
+        512
+      ],
+      "context_tokens": [
+        2500,
+        3500
+      ],
+      "context_source": [
+        "agent-replay",
+        "random"
+      ],
+      "measure_tokens": 128,
+      "warmup_tokens": 16,
+      "temperature": 1.0,
+      "capacity_check": "advisory"
+    }
+  }
+}

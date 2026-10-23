@@ -1,0 +1,33 @@
+{
+  "id": "dsv4-moe-overlap-e2e-base-0",
+  "owner": "dsv4-moe-overlap",
+  "kind": "e2e",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "0",
+    "TPU_TOKEN_PADDINGS_PER_DP": "4,16,512",
+    "GPU_MEM": "0.76",
+    "MOE_PACKED_ROUTE_GATHER": "1",
+    "MOE_PACKED_ROUTE_GATHER_MAX_TOKENS": "512"
+  },
+  "serve_args_extra": [],
+  "acceptance": "exact",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": false,
+  "est_minutes": 60,
+  "abort_if": [
+    "post-ready RESOURCE_EXHAUSTED",
+    "post-ready model/runner JIT compilation",
+    "launch-id mismatch",
+    "startup > 60 min",
+    "reduction-order gate failure"
+  ],
+  "success": "Exact tokens and logprobs vs baseline-1 (packed gather is pure data movement, bitwise on HW in coll32-3) and 32-agent tok/s/user > baseline-1 24.04 by > 1.9%; serve.log shows '[MoE]: packed route+hidden all-gather (H15b)'.",
+  "fallback": null
+}

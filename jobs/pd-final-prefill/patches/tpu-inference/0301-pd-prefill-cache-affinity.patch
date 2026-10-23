@@ -1,0 +1,20 @@
+diff --git a/tpu_inference/core/sched/dp_scheduler.py b/tpu_inference/core/sched/dp_scheduler.py
+--- a/tpu_inference/core/sched/dp_scheduler.py
++++ b/tpu_inference/core/sched/dp_scheduler.py
+@@ -831,6 +831,16 @@
+ 
+     def _pick_rank_for_request(self, request: Request) -> int:
+         """Choose the DP rank for a new request per the routing policy."""
++        # Benchmark-only affinity: keep warm and timed requests on the same cache.
++        if os.environ.get("PD_CACHE_AFFINITY") == "1":
++            params = getattr(request, "sampling_params", None)
++            extra = getattr(params, "extra_args", None) or {}
++            rank = extra.get("pd_cache_rank")
++            if rank is not None:
++                if type(rank) is not int or not 0 <= rank < self.dp_size:
++                    raise ValueError("pd_cache_rank outside attention-DP mesh")
++                return rank
++
+         if self._routing_policy == self.RoutingPolicy.ROUND_ROBIN:
+             rank = self._round_robin_next_rank
+             self._round_robin_next_rank = (rank + 1) % self.dp_size

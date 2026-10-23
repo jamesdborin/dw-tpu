@@ -1,0 +1,176 @@
+diff --git a/tpu_inference/kernels/experimental/dense_fp8.py b/tpu_inference/kernels/experimental/dense_fp8.py
+new file mode 100644
+index 0000000..673b079
+--- /dev/null
++++ b/tpu_inference/kernels/experimental/dense_fp8.py
+@@ -0,0 +1,122 @@
++"""Dense FP8 W8A16 GEMM candidates with FP32 partials and accumulation.
++
++`native` preserves FP8 RHS values as dot operands; `wide` explicitly converts
++an entire tile to BF16. `pre` preserves baseline weight-scaling arithmetic.
++`flipped` tests weight-as-LHS scheduling without changing input precision.
++"""
++import functools
++
++import jax
++import jax.numpy as jnp
++from jax.experimental import pallas as pl
++from jax.experimental.pallas import tpu as pltpu
++
++
++@functools.partial(jax.jit, static_argnames=('tn', 'tk', 'tm', 'mode'))
++def matmul(x, w, s, *, tn=1024, tk=1024, tm=16, mode='native'):
++    m, k = x.shape
++    n = w.shape[1]
++    tm = min(tm, m)
++    assert m % tm == 0 and k % tk == 0 and n % tn == 0 and tk % 128 == 0
++    step_n = tn if mode in ('wide', 'flipped', 'native') else 256
++
++    def kernel(x_ref, w_ref, s_ref, out_ref, acc_ref):
++        k_index = pl.program_id(2)
++
++        @pl.when(k_index == 0)
++        def initialize():
++            acc_ref[...] = jnp.zeros((tm, tn), jnp.float32)
++
++        lhs = x_ref[...]
++        rhs = w_ref[...]
++        if mode not in ('native', 'flipped'):
++            rhs = rhs.astype(jnp.bfloat16)
++        scales = s_ref[...].reshape(tk // 128, tn)
++        partials = []
++        for start_n in range(0, tn, step_n):
++            end_n = min(tn, start_n + step_n)
++            acc = jnp.zeros((tm, end_n - start_n), jnp.float32)
++            if mode == 'pre':
++                block = rhs[:, start_n:end_n].reshape(tk // 128, 128, -1)
++                block = block * scales[:, None, start_n:end_n].astype(jnp.bfloat16)
++                acc = jnp.dot(lhs, block.reshape(tk, -1),
++                              preferred_element_type=jnp.float32)
++            else:
++                for start_k in range(0, tk, 128):
++                    a = lhs[:, start_k:start_k + 128]
++                    b = rhs[start_k:start_k + 128, start_n:end_n]
++                    if mode == 'flipped':
++                        dot = jnp.dot(b.T, a.T, preferred_element_type=jnp.float32).T
++                    else:
++                        dot = jnp.dot(a, b, preferred_element_type=jnp.float32)
++                    scale = scales[start_k // 128:start_k // 128 + 1, start_n:end_n]
++                    acc = acc + dot * scale
++            partials.append(acc)
++        acc_ref[...] = acc_ref[...] + jnp.concatenate(partials, axis=1)
++
++        @pl.when(k_index == k // tk - 1)
++        def store():
++            out_ref[...] = acc_ref[...].astype(jnp.bfloat16)
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
++        grid=(m // tm, n // tn, k // tk),
++        in_specs=(
++            pl.BlockSpec((tm, tk), lambda mi, ni, ki: (mi, ki)),
++            pl.BlockSpec((tk, tn), lambda mi, ni, ki: (ki, ni)),
++            pl.BlockSpec((tk // 128, 1, tn), lambda mi, ni, ki: (ki, 0, ni)),
++        ),
++        out_specs=pl.BlockSpec((tm, tn), lambda mi, ni, ki: (mi, ni)),
++        scratch_shapes=[pltpu.VMEM((tm, tn), jnp.float32)],
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=('parallel', 'parallel', 'arbitrary'),
++            vmem_limit_bytes=96 * 1024 * 1024),
++        name='dgemm_' + mode,
++    )(x, w, s.reshape(k // 128, 1, n))
++
++
++# Measured on one TPU v6e; unsupported shapes retain the original kernel.
++_TUNED = {(4, 1024, 8192): ('native', 4, 1024, 2048),
++ (4, 1024, 32768): ('megablox', 4, 1024, 4096),
++ (4, 2048, 4096): ('native', 4, 1024, 4096),
++ (4, 4096, 1536): ('native', 4, 4096, 512),
++ (4, 4096, 4096): ('native', 4, 4096, 1024),
++ (4, 8192, 4096): ('native', 4, 1024, 4096),
++ (16, 1024, 8192): ('native', 16, 1024, 2048),
++ (16, 1024, 32768): ('native', 16, 1024, 2048),
++ (16, 2048, 4096): ('native', 16, 1024, 2048),
++ (16, 4096, 1536): ('native', 16, 4096, 512),
++ (16, 4096, 4096): ('native', 16, 1024, 4096),
++ (16, 8192, 4096): ('native', 16, 8192, 512),
++ (512, 1024, 8192): ('megablox', 128, 1024, 2048),
++ (512, 1024, 32768): ('megablox', 128, 1024, 2048),
++ (512, 2048, 4096): ('megablox', 128, 1024, 2048),
++ (512, 4096, 4096): ('megablox', 128, 1024, 2048),
++ (512, 8192, 4096): ('megablox', 128, 1024, 2048)}
++
++
++def try_dense_fp8(x, weight, scale):
++    """Return a qualified dense result, or None to retain the caller's fallback."""
++    if x.dtype != jnp.bfloat16 or weight.dtype != jnp.float8_e4m3fn:
++        return None
++    if x.ndim != 2 or weight.ndim != 2 or scale.dtype != jnp.float32:
++        return None
++    m, k = x.shape
++    n = weight.shape[1]
++    entry = _TUNED.get((m, k, n))
++    if entry is None or weight.shape[0] != k:
++        return None
++    if scale.shape not in ((k // 128, 1, n), (1, k // 128, 1, n)):
++        return None
++    # The qualification is specific to v6e; do not alter other TPU paths.
++    if jax.local_devices()[0].device_kind != "TPU v6 lite":
++        return None
++    mode, tm, tk, tn = entry
++    scale = scale.reshape(k // 128, 1, n)
++    if mode == "megablox":
++        from tpu_inference.kernels.megablox.gmm import gmm
++        return gmm(x, weight[None], jnp.array([m], jnp.int32),
++                   preferred_element_type=jnp.bfloat16,
++                   rhs_scale=scale[None], tiling=(tm, tk, tn))
++    return matmul(x, weight, scale, tm=tm, tk=tk, tn=tn, mode=mode)
+diff --git a/tpu_inference/layers/common/linear.py b/tpu_inference/layers/common/linear.py
+index d2aeb80..adce874 100644
+--- a/tpu_inference/layers/common/linear.py
++++ b/tpu_inference/layers/common/linear.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import dataclasses
++import os
+ 
+ import jax
+ import jax.numpy as jnp
+@@ -251,18 +252,23 @@ def sharded_quantized_matmul(x: jax.Array,
+ 
+     def wrapper(x, w_q, w_s):
+         if enable_quantized_matmul_kernel:
+-            output = gmm_v2(
+-                lhs=x,
+-                rhs=jnp.expand_dims(w_q, 0),
+-                group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
+-                rhs_scale=w_s if w_s.ndim == 4 else jnp.expand_dims(w_s, 0),
+-                rhs_bias=None,
+-                group_offset=jnp.array([0], dtype=jnp.int32),
+-                tile_info=_safe_calculate_tiling,
+-                zero_initialize=False,
+-                preferred_element_type=x.dtype,
+-                maybe_quantize_lhs=maybe_quantize_x,
+-            )
++            output = None
++            if os.environ.get("DSV4_DENSE_FP8_GEMM", "0") == "1":
++                from tpu_inference.kernels.experimental.dense_fp8 import try_dense_fp8
++                output = try_dense_fp8(x, w_q, w_s)
++            if output is None:
++                output = gmm_v2(
++                    lhs=x,
++                    rhs=jnp.expand_dims(w_q, 0),
++                    group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
++                    rhs_scale=w_s if w_s.ndim == 4 else jnp.expand_dims(w_s, 0),
++                    rhs_bias=None,
++                    group_offset=jnp.array([0], dtype=jnp.int32),
++                    tile_info=_safe_calculate_tiling,
++                    zero_initialize=False,
++                    preferred_element_type=x.dtype,
++                    maybe_quantize_lhs=maybe_quantize_x,
++                )
+         else:
+             output = xla_quantized_matmul(x,
+                                           w_q,

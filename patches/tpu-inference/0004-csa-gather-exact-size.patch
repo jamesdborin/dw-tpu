@@ -1,0 +1,39 @@
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index 92ce033..11f313a 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -524,6 +524,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "MLA_TRANSPOSE_KV_CACHE":
+     env_bool("MLA_TRANSPOSE_KV_CACHE", default=False),
+     # Minimum max num of batched tokens.
++    "DSV4_H17_SMALL_GATHER":
++    lambda: os.getenv("DSV4_H17_SMALL_GATHER", "0") == "1",
+     "MIN_TOKEN_BUCKET":
+     lambda: int(os.getenv("MIN_TOKEN_BUCKET") or "16"),
+     # Route padding tokens to expert 0 instead of picking other experts, to
+diff --git a/tpu_inference/kernels/experimental/deepseek_v4/core_attention/csa_gather.py b/tpu_inference/kernels/experimental/deepseek_v4/core_attention/csa_gather.py
+index a7c43f4..0e23bf9 100644
+--- a/tpu_inference/kernels/experimental/deepseek_v4/core_attention/csa_gather.py
++++ b/tpu_inference/kernels/experimental/deepseek_v4/core_attention/csa_gather.py
+@@ -18,6 +18,7 @@ from typing import Any
+ import jax
+ import jax.numpy as jnp
+ from jax import lax
++from tpu_inference import envs
+ from jax.experimental import pallas as pl
+ from jax.experimental.pallas import tpu as pltpu
+ from jax.experimental.pallas import tpu_sc as plsc
+@@ -302,7 +303,12 @@ def csa_gather(
+     # pipeline step to keep multiple gather DMAs in flight.
+     # See `outer_pipeline` for details.
+     num_streams = 2
+-    num_row_subchunks = 32
++    # B1 decode gathers 4 queries x 512 selected KV rows. Avoid
++    # rounding that 2048-row payload to 8192 rows on v6e.
++    num_row_subchunks = (8 if envs.DSV4_H17_SMALL_GATHER
++                         and out_size == 2048
++                         and num_simd_lanes == 8 and num_cores == 32
++                         else 32)
+     assert (
+         num_row_subchunks %
+         num_streams == 0), f"{num_streams=} must divide {num_row_subchunks=}."

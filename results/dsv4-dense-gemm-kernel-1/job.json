@@ -1,0 +1,26 @@
+{
+  "id": "dsv4-dense-gemm-kernel-1",
+  "owner": "dsv4-dense-gemm",
+  "kind": "kernel",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "1"
+  },
+  "serve_args_extra": [],
+  "acceptance": "reduction-order",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": false,
+  "est_minutes": 35,
+  "abort_if": [
+    "non-v6e or local chip count != 4",
+    "numerical gate failure"
+  ],
+  "success": "All 246 shape/M pairs complete; finite/repeatable outputs; RMS <= 1.10x baseline and max abs <= 2x baseline vs float64 on both seeds. No newly enabled shape has a material (>5%) latency regression; otherwise tune or revert that shape before e2e.",
+  "fallback": null
+}

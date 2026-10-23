@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+AGENT_PROGRESS.md
+AGENT_PROGRESS.md.lock
+*.lock
+.env
+*.env
+key.json
+*-key.json
+jobs/*/result/

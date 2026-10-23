@@ -1,0 +1,123 @@
+From 415a0bc389843afbd8767979d6bf9c32247df209 Mon Sep 17 00:00:00 2001
+From: dsv4-fusedmoe-fp4 <james.dborin@doubleword.ai>
+Date: Wed, 21 Oct 2026 17:58:31 +0100
+Subject: [PATCH 2/2] fused_ep_moe: opt-in next-expert weight prefetch;
+ integration flag
+
+---
+ tpu_inference/envs.py                        |  5 ++++
+ tpu_inference/kernels/fused_moe/v1/kernel.py | 27 ++++++++++++++++++--
+ tpu_inference/layers/common/moe.py           |  1 +
+ 3 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
+index 94bed1565..e260591d0 100644
+--- a/tpu_inference/envs.py
++++ b/tpu_inference/envs.py
+@@ -27,6 +27,7 @@ if TYPE_CHECKING:
+     FUSED_MOE_FP4_EMULATION: bool = False
+     FUSED_MOE_BLOCK_SIZES: str = ""
+     FUSED_MOE_ONESHOT_METADATA: bool = False
++    FUSED_MOE_PREFETCH_NEXT_EXPERT: bool = False
+     USE_UNFUSED_MEGABLOCKS: bool = False
+     USE_DENSE_MOE: bool = False
+     NUM_SLICES: int = 1
+@@ -307,6 +308,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # all-to-all (one barrier) instead of the kernel's (N-1)-step ring.
+     "FUSED_MOE_ONESHOT_METADATA":
+     env_bool("FUSED_MOE_ONESHOT_METADATA", default=False),
++    # FUSED_MOE_FP4_EMULATION: start the next local expert's first weight
++    # block during the current expert's last one (bitwise-identical output).
++    "FUSED_MOE_PREFETCH_NEXT_EXPERT":
++    env_bool("FUSED_MOE_PREFETCH_NEXT_EXPERT", default=False),
+     # Enable megablocks for JAX sparse matmul for MoE (Mixture of Experts)
+     # using Unfused weights
+     "USE_UNFUSED_MEGABLOCKS":
+diff --git a/tpu_inference/kernels/fused_moe/v1/kernel.py b/tpu_inference/kernels/fused_moe/v1/kernel.py
+index 4b2412ffe..8cc0bcdc4 100644
+--- a/tpu_inference/kernels/fused_moe/v1/kernel.py
++++ b/tpu_inference/kernels/fused_moe/v1/kernel.py
+@@ -308,6 +308,7 @@ def _fused_ep_moe_kernel(
+         fp4_codes: bool = False,
+         precomputed_routing: bool = False,
+         oneshot_metadata: bool = False,
++        prefetch_next_expert: bool = False,
+         # Kernel tuning params.
+         bt: int,  # Block size of local_num_tokens.
+         bf: int,  # Block size of intermediate_size.
+@@ -912,6 +913,18 @@ def _fused_ep_moe_kernel(
+         elif next_bd2_id < num_bd2:
+             start_fetch_bw2(local_e_id, next_sem_id, bf_id, next_bd2_id)
+         elif next_bd2_id == num_bd2:
++            if bf_id + 1 == num_bf and prefetch_next_expert:
++                # Last weight block of this expert: the w1/w3 buffers are idle,
++                # so start the next expert's first w1/w3 block now instead of
++                # after the expert boundary (run_per_expert skips it then).
++                # Each expert uses an even number of blocks, so it lands in
++                # the slot (0) the next expert reads first.
++                assert next_sem_id == 0, next_sem_id
++
++                @pl.when(local_e_id + 1 < local_num_experts)
++                def _():
++                    start_fetch_bw1(local_e_id + 1, 0, 0, 0)
++                    start_fetch_bw3(local_e_id + 1, 0, 0, 0)
+             start_fetch_next_bw(local_e_id, bw_sem_id, bf_id + 1, -1, -1)
+         else:
+             raise RuntimeError("Unreachable")
+@@ -1330,8 +1343,15 @@ def _fused_ep_moe_kernel(
+             # because the expert_ffn keeps overwriting the buffers. Triple buffering
+             # could resolve this but it takes more VMEM scratch. Need further
+             # experiment on this.
+-            start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
+-            start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
++            if prefetch_next_expert:
++                # Experts after the first were prefetched by the previous one.
++                @pl.when(local_e_id == 0)
++                def _():
++                    start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
++                    start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
++            else:
++                start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
++                start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
+ 
+             # Next ids.
+             next_e_sem_id = lax.select(e_sem_id == 0, 1, 0)
+@@ -1407,6 +1427,7 @@ def _fused_ep_moe_kernel(
+         "subc_quant_w2_sz",
+         "fp4_codes",
+         "oneshot_metadata",
++        "prefetch_next_expert",
+         "bt",
+         "bf",
+         "bd1",
+@@ -1430,6 +1451,7 @@ def fused_ep_moe(
+     topk_ids: jax.Array | None = None,  # I32(num_tokens, top_k)
+     fp4_codes: bool = False,
+     oneshot_metadata: bool = False,
++    prefetch_next_expert: bool = False,
+     renormalize_topk_logits: bool = False,
+     act_fn: str = "silu",
+     scoring_fn: str = "softmax",
+@@ -1727,6 +1749,7 @@ def fused_ep_moe(
+             fp4_codes=fp4_codes,
+             precomputed_routing=precomputed_routing,
+             oneshot_metadata=oneshot_metadata,
++            prefetch_next_expert=prefetch_next_expert,
+             bt=bt,
+             bf=bf,
+             bd1=bd1,
+diff --git a/tpu_inference/layers/common/moe.py b/tpu_inference/layers/common/moe.py
+index 62d956a16..fd69e7c3d 100644
+--- a/tpu_inference/layers/common/moe.py
++++ b/tpu_inference/layers/common/moe.py
+@@ -158,6 +158,7 @@ def _fused_moe_fp4_apply(layer, x: jax.Array, gating_output: jax.Array,
+         topk_ids=topk_ids,
+         fp4_codes=True,
+         oneshot_metadata=envs.FUSED_MOE_ONESHOT_METADATA,
++        prefetch_next_expert=envs.FUSED_MOE_PREFETCH_NEXT_EXPERT,
+         act_fn=activation,
+         subc_quant_w1_sz=qb1,
+         subc_quant_w2_sz=qb2,
+-- 
+2.34.1
+

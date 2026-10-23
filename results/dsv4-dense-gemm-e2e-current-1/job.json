@@ -1,0 +1,30 @@
+{
+  "id": "dsv4-dense-gemm-e2e-current-1",
+  "owner": "dsv4-dense-gemm",
+  "kind": "e2e",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "1",
+    "TPU_TOKEN_PADDINGS_PER_DP": "4,16,512",
+    "DSV4_FINE_TOKEN_BUCKETS": "0"
+  },
+  "serve_args_extra": [],
+  "acceptance": "reduction-order",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": true,
+  "est_minutes": 60,
+  "abort_if": [
+    "post-ready RESOURCE_EXHAUSTED",
+    "launch-id mismatch",
+    "startup > 60 min"
+  ],
+  "success": "Pass reduction-order gate; improve 32-agent tok/s/user and TPM versus baseline-1 on the same 4,16,512 buckets.",
+  "fallback": null,
+  "benchmark_on_gate_failure": true
+}

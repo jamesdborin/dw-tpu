@@ -1,0 +1,82 @@
+diff --git a/pdmini/correctness.py b/pdmini/correctness.py
+index 78bcbceeb..39f8b0b83 100644
+--- a/pdmini/correctness.py
++++ b/pdmini/correctness.py
+@@ -80,6 +80,7 @@ def run(args):
+ def compare(a_path, b_path):
+     a, b = json.load(open(a_path)), json.load(open(b_path))
+     worst, ok = 0.0, True
++    all_diffs = []
+     rows = []
+     for name in a:
+         x, y = a[name], b.get(name)
+@@ -97,6 +98,8 @@ def compare(a_path, b_path):
+                                             y["token_logprobs"][:n])
+                  if p is not None and q is not None]
+         mx = max(diffs) if diffs else 0.0
++        mean = sum(diffs) / len(diffs) if diffs else 0.0
++        all_diffs += diffs
+         top_eq = sum(
+             set(p) == set(q) for p, q in zip(x["top_logprobs"][:n],
+                                              y["top_logprobs"][:n]))
+@@ -104,11 +107,14 @@ def compare(a_path, b_path):
+         ok &= tok_eq
+         rows.append((name, x["prompt_len"], "tokens_equal" if tok_eq else
+                      f"DIVERGE@{first_div}", f"max|dlogp|={mx:.3g}",
++                     f"mean|dlogp|={mean:.3g}",
+                      f"top5_sets_equal={top_eq}/{n}",
+                      "bitexact" if tok_eq and mx == 0 else ""))
+     for r in rows:
+         print(" | ".join(str(v) for v in r))
+-    print(f"ALL_TOKENS_EQUAL={ok} worst_max_abs_logprob_diff={worst:.3g}")
++    mae = sum(all_diffs) / len(all_diffs) if all_diffs else 0.0
++    print(f"ALL_TOKENS_EQUAL={ok} worst_max_abs_logprob_diff={worst:.3g} "
++          f"mean_abs_logprob_diff={mae:.3g} positions={len(all_diffs)}")
+     return 0 if ok else 1
+ 
+ 
+diff --git a/pdmini/fake_vllm.py b/pdmini/fake_vllm.py
+index 3096747c4..40b85b15a 100644
+--- a/pdmini/fake_vllm.py
++++ b/pdmini/fake_vllm.py
+@@ -70,7 +70,11 @@ async def completions(request: Request):
+             out.append(tok)
+             ch = dict(choices=[dict(index=0, text="t", token_ids=[tok],
+                                     logprobs=None, finish_reason=None)])
+-            yield f"data: {json.dumps(ch)}\n\n".encode()
++            ev = f"data: {json.dumps(ch)}\n\n".encode()
++            # Split every event across two network chunks (router test).
++            yield ev[:len(ev) // 2]
++            await asyncio.sleep(0.001)
++            yield ev[len(ev) // 2:]
+         CACHE.update(block_hashes(ids + out, 1024))
+         u = dict(usage, completion_tokens=n)
+         yield f"data: {json.dumps(dict(choices=[], usage=u))}\n\n".encode()
+diff --git a/pdmini/pd_router.py b/pdmini/pd_router.py
+index c45275d0b..f7e3c4614 100644
+--- a/pdmini/pd_router.py
++++ b/pdmini/pd_router.py
+@@ -242,15 +242,18 @@ async def completions(request: Request):
+         return StreamingResponse(gen(), media_type="text/event-stream")
+     # Non-streaming client: collect the stream into one completion.
+     text, token_ids, logprobs, finish, usage = [], [], None, None, None
++    buf = b""
+     async for chunk in gen():
+-        for ev in chunk.split(b"\n\n"):
++        # SSE events can be split across network chunks: parse only
++        # complete events and keep the remainder.
++        buf += chunk
++        events = buf.split(b"\n\n")
++        buf = events.pop()
++        for ev in events:
+             ev = ev.strip()
+             if not ev.startswith(b"data: ") or ev[6:] == b"[DONE]":
+                 continue
+-            try:
+-                j = json.loads(ev[6:])
+-            except ValueError:
+-                continue
++            j = json.loads(ev[6:])
+             if j.get("usage"):
+                 usage = j["usage"]
+             for ch in j.get("choices") or []:

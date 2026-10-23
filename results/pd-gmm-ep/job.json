@@ -1,0 +1,82 @@
+{
+  "id": "pd-gmm-ep",
+  "owner": "dsv4-moe-overlap",
+  "kind": "e2e",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "0",
+    "TPU_TOKEN_PADDINGS_PER_DP": "4,8,16,512",
+    "GPU_MEM": "0.68",
+    "MOE_PACKED_ROUTE_GATHER": "1",
+    "MOE_PACKED_ROUTE_GATHER_MAX_TOKENS": "512",
+    "MNBT": "512",
+    "MOE_F32_REDUCE": "1",
+    "MOE_ONESHOT_SCATTER": "1",
+    "MOE_ONESHOT_MAX_TOKENS": "512"
+  },
+  "serve_args_extra": [
+    "--enable-prompt-tokens-details",
+    "--enable-expert-parallel"
+  ],
+  "acceptance": "reduction-order",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": true,
+  "est_minutes": 60,
+  "abort_if": [
+    "post-ready RESOURCE_EXHAUSTED",
+    "post-ready model/runner JIT compilation",
+    "launch-id mismatch",
+    "startup > 60 min",
+    "reduction-order gate failure"
+  ],
+  "success": "serve.log shows '[MoE]: Using GMM EP kernel' and the packed-gather line and 'one-shot output reduce-scatter'; pd.json decode/prefill cases vs pd-base0 (timing is the goal; gate result reported).",
+  "fallback": null,
+  "bench_mode": "pd",
+  "pd": {
+    "prefill": {
+      "cases": [
+        {
+          "name": "cold5k",
+          "prompt_tokens": 5000,
+          "concurrency": [
+            32
+          ]
+        },
+        {
+          "name": "incr1650_on8k",
+          "cached_prefix_tokens": 8000,
+          "new_tokens": 1650,
+          "concurrency": [
+            32
+          ]
+        }
+      ],
+      "max_tokens": 1
+    },
+    "decode": {
+      "concurrency": [
+        32,
+        128,
+        256
+      ],
+      "context_tokens": [
+        5000
+      ],
+      "context_source": [
+        "agent-replay",
+        "random"
+      ],
+      "measure_tokens": 128,
+      "warmup_tokens": 16,
+      "temperature": 1.0,
+      "capacity_check": "advisory"
+    }
+  },
+  "benchmark_on_gate_failure": true
+}

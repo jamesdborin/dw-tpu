@@ -1,0 +1,87 @@
+{
+  "id": "pd-specdec",
+  "owner": "dsv4-runner",
+  "kind": "e2e",
+  "base": "dw-tpu@35a967ed4ad45954080abf5158539468e646d1c5",
+  "depends_on": [
+    "dsv4-moe-overlap-e2e-base-0"
+  ],
+  "env": {
+    "DSV4_DENSE_FP8_GEMM": "0",
+    "RAY_DEDUP_LOGS": "0",
+    "DRAFT_MODEL_IMPL_TYPE": "vllm",
+    "GPU_MEM": "0.68",
+    "TPU_TOKEN_PADDINGS_PER_DP": "4,8,16,512",
+    "MNBT": "512",
+    "VLLM_XLA_CHECK_RECOMPILATION": "0"
+  },
+  "serve_args_extra": [
+    "--speculative-config",
+    "{\"method\": \"mtp\", \"num_speculative_tokens\": 3, \"disable_eagle_block_drop\": true}",
+    "--enable-prompt-tokens-details"
+  ],
+  "acceptance": "sampling-equivalent",
+  "bench": {
+    "agents": [
+      32
+    ],
+    "repeats": 1
+  },
+  "profile": false,
+  "est_minutes": 110,
+  "abort_if": [
+    "post-ready RESOURCE_EXHAUSTED",
+    "launch-id mismatch",
+    "startup > 55 min",
+    "acceptance gate failure"
+  ],
+  "success": "Original acceptance gates pass; pd.json contains validated pure-decode and prefill cases. P/D model is best-case informational, not measured deployment throughput.",
+  "fallback": null,
+  "bench_mode": "pd",
+  "pd": {
+    "prefill": {
+      "cases": [
+        {
+          "name": "cold5k",
+          "prompt_tokens": 5000,
+          "concurrency": [
+            32,
+            64
+          ]
+        },
+        {
+          "name": "incr1650_on8k",
+          "cached_prefix_tokens": 8000,
+          "new_tokens": 1650,
+          "concurrency": [
+            32,
+            64
+          ]
+        }
+      ],
+      "max_tokens": 1
+    },
+    "decode": {
+      "concurrency": [
+        1,
+        8,
+        16,
+        32,
+        64,
+        128
+      ],
+      "context_tokens": [
+        5000,
+        10000,
+        15000
+      ],
+      "context_source": [
+        "random",
+        "agent-replay"
+      ],
+      "measure_tokens": 128,
+      "warmup_tokens": 16,
+      "temperature": 1.0
+    }
+  }
+}
